@@ -1,0 +1,186 @@
+import re
+import yaml
+import os
+from collections import defaultdict
+
+def parse_asa_config(filepath):
+    """Parse ASA config file and extract objects, object-groups, and access-lists."""
+    with open(filepath, encoding="utf-8") as f:
+        lines = [line.rstrip() for line in f]
+
+    objects, object_groups = [], []
+    access_lists = defaultdict(list)
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("object network") or line.startswith("object service"):
+            obj, i = parse_object(lines, i)
+            objects.append(obj)
+        elif line.startswith("object-group"):
+            obj_grp, i = parse_object_group(lines, i)
+            object_groups.append(obj_grp)
+        elif line.startswith("access-list"):
+            acl = parse_access_list(line)
+            if acl:
+                access_lists[acl['acl_name']].append(acl['entry'])
+            i += 1
+        else:
+            i += 1
+    return objects, object_groups, access_lists
+
+def parse_object(lines, idx):
+    """Parse object network/service block."""
+    header = lines[idx].split()
+    obj = {'name': header[-1], 'type': header[1]}
+    idx += 1
+    while idx < len(lines) and lines[idx].startswith(' '):
+        l = lines[idx].strip()
+        if obj['type'] == 'network':
+            for t in ('host', 'range', 'subnet', 'fqdn'):
+                if l.startswith(f'{t} '):
+                    obj['network_type'] = t
+                    obj['value'] = l.split(' ', 1)[1]
+        elif obj['type'] == 'service':
+            m = re.match(r'service (\w+)(?: destination eq (\S+))?', l)
+            if m:
+                obj['protocol'] = m.group(1)
+                if m.group(2):
+                    obj['destination_port'] = m.group(2)
+        if l.startswith('description '):
+            obj['description'] = l[12:]
+        idx += 1
+    return obj, idx
+
+def parse_object_group(lines, idx):
+    """Parse object-group block."""
+    header = lines[idx].split()
+    obj_grp = {'name': header[-1], 'type': header[1], 'members': []}
+    idx += 1
+    while idx < len(lines) and lines[idx].startswith(' '):
+        l = lines[idx].strip()
+        if l.startswith('description '):
+            obj_grp['description'] = l[12:]
+        elif obj_grp['type'] == 'service':
+            if l.startswith('service-object object '):
+                obj_grp['members'].append({'object': l.split()[-1]})
+            elif l.startswith('service-object '):
+                m = re.match(r'service-object (\w+)(?: destination eq (\S+))?', l)
+                if m:
+                    member = {'protocol': m.group(1)}
+                    if m.group(2):
+                        member['destination_port'] = m.group(2)
+                    obj_grp['members'].append(member)
+        elif obj_grp['type'] == 'network':
+            if l.startswith('group-object '):
+                obj_grp['members'].append({'group_object': l.split()[-1]})
+            elif l.startswith('network-object object '):
+                obj_grp['members'].append({'object': l.split()[-1]})
+            elif l.startswith('network-object '):
+                parts = l.split()
+                if len(parts) == 3:
+                    obj_grp['members'].append({'network_type': 'host', 'value': parts[1]})
+                elif len(parts) == 4:
+                    obj_grp['members'].append({'network_type': 'subnet', 'value': f"{parts[1]} {parts[2]}"})
+        idx += 1
+    return obj_grp, idx
+
+def parse_acl_entity(tokens, idx):
+    """Parse source or destination entity in ACL."""
+    if idx >= len(tokens):
+        return {'type': 'any', 'value': 'any'}, idx
+    t = tokens[idx]
+    # any
+    if t == 'any':
+        return {'type': 'any', 'value': 'any'}, idx + 1
+    # host <ip>
+    if t == 'host' and idx + 1 < len(tokens):
+        return {'type': 'host', 'value': tokens[idx + 1]}, idx + 2
+    # object/object-group <name>
+    if t in ('object', 'object-group') and idx + 1 < len(tokens):
+        return {'type': t, 'value': tokens[idx + 1]}, idx + 2
+    # <ip> <mask> (subnet)
+    if re.match(r'\d+\.\d+\.\d+\.\d+', t):
+        if idx + 1 < len(tokens) and re.match(r'\d+\.\d+\.\d+\.\d+', tokens[idx + 1]):
+            return {'type': 'subnet', 'value': f"{t} {tokens[idx + 1]}"}, idx + 2
+        return {'type': 'host', 'value': t}, idx + 1
+    # fallback
+    return {'type': 'unknown', 'value': t}, idx + 1
+
+def parse_access_list(line):
+    """
+    Parse a single access-list line into YAML structure.
+    Handles all ASA ACL forms: protocol/service, source, destination, port (if present).
+    """
+    tokens = line.split()
+    ### Debugging output
+    # print("DEBUG LINE:", line)
+    # print("TOKENS:", tokens)
+    
+    if len(tokens) < 6 or tokens[2] != 'extended':
+        return None
+    acl_name = tokens[1]
+    action = tokens[3]  # Corrected: action is always at index 3 (permit/deny)
+    idx = 4
+
+    # 1. Service/protocol (can be 2 tokens)
+    proto_token = tokens[idx]
+    service = {}
+    if proto_token in ('tcp', 'udp', 'icmp', 'ip'):
+        service['type'] = proto_token
+        idx += 1
+        port_after = True
+    elif proto_token in ('object', 'object-group'):
+        service['type'] = proto_token
+        service['value'] = tokens[idx + 1]
+        idx += 2
+        port_after = False
+    else:
+        service['type'] = proto_token
+        idx += 1
+        port_after = True
+
+    # 2. Source (can be 2 tokens)
+    source, idx = parse_acl_entity(tokens, idx)
+    # 3. Destination (can be 2 tokens)
+    destination, idx = parse_acl_entity(tokens, idx)
+
+    # 4. Port (for tcp/udp, after destination)
+    port = None
+    if port_after and service['type'] in ('tcp', 'udp') and idx < len(tokens):
+        if tokens[idx] == 'eq' and idx + 1 < len(tokens):
+            port = tokens[idx + 1]
+            idx += 2
+
+    if port:
+        service['port'] = port
+
+    entry = {
+        'source': source,
+        'destination': destination,
+        'service': service,
+        'action': action
+    }
+    ### Debugging output
+    # print("SERVICE:", service)
+    # print("SOURCE:", source)
+    # print("DESTINATION:", destination)
+    # print("ENTRY:", entry)
+    
+    return {'acl_name': acl_name, 'entry': entry}
+
+def write_yaml(filepath, data):
+    """Write data to YAML file, creating directories if needed."""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, 'w', encoding="utf-8") as f:
+        yaml.dump(data, f, sort_keys=False, allow_unicode=True)
+
+def main():
+    config_file = os.path.join("config", "asa_config.txt")
+    objects, object_groups, access_lists = parse_asa_config(config_file)
+    write_yaml(os.path.join("yaml", "objects.yaml"), objects)
+    write_yaml(os.path.join("yaml", "object-groups.yaml"), object_groups)
+    acl_yaml = [{'acl_name': name, 'entries': entries} for name, entries in access_lists.items()]
+    write_yaml(os.path.join("yaml", "access-lists.yaml"), acl_yaml)
+
+if __name__ == "__main__":
+    main()
