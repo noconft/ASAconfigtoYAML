@@ -1,6 +1,7 @@
 import re
 import yaml
 import os
+import sys
 from collections import defaultdict
 from logger import get_logger  # Import the centralized logger
 
@@ -14,6 +15,17 @@ def parse_asa_config(filepath):
     net_objects, svc_objects = [], []
     net_obj_groups, svc_obj_groups = [], []
     access_lists = defaultdict(list)
+
+    # Stats for summary
+    stats = {
+        'net_objects': {'parsed': 0, 'skipped': 0},
+        'svc_objects': {'parsed': 0, 'skipped': 0},
+        'net_obj_groups': {'parsed': 0, 'skipped': 0},
+        'svc_obj_groups': {'parsed': 0, 'skipped': 0},
+        'acl_entries': {'parsed': 0, 'skipped': 0},
+        'critical_errors': 0
+    }
+
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -22,39 +34,50 @@ def parse_asa_config(filepath):
                 obj, i = parse_network_object(lines, i)
                 if sanity_check_network_object(obj):
                     net_objects.append(obj)
+                    stats['net_objects']['parsed'] += 1
                 else:
                     logger.warning(f"Invalid network object at line {i}: {obj}")
+                    stats['net_objects']['skipped'] += 1
             elif line.startswith("object service"):
                 obj, i = parse_service_object(lines, i)
                 if sanity_check_service_object(obj):
                     svc_objects.append(obj)
+                    stats['svc_objects']['parsed'] += 1
                 else:
                     logger.warning(f"Invalid service object at line {i}: {obj}")
+                    stats['svc_objects']['skipped'] += 1
             elif line.startswith("object-group network"):
                 obj_grp, i = parse_network_object_group(lines, i)
                 if sanity_check_network_object_group(obj_grp):
                     net_obj_groups.append(obj_grp)
+                    stats['net_obj_groups']['parsed'] += 1
                 else:
                     logger.warning(f"Invalid network object-group at line {i}: {obj_grp}")
+                    stats['net_obj_groups']['skipped'] += 1
             elif line.startswith("object-group service"):
                 obj_grp, i = parse_service_object_group(lines, i)
                 if sanity_check_service_object_group(obj_grp):
                     svc_obj_groups.append(obj_grp)
+                    stats['svc_obj_groups']['parsed'] += 1
                 else:
                     logger.warning(f"Invalid service object-group at line {i}: {obj_grp}")
+                    stats['svc_obj_groups']['skipped'] += 1
             elif line.startswith("access-list"):
                 acl = parse_access_list(line)
                 if acl and sanity_check_acl_entry(acl['entry']):
                     access_lists[acl['acl_name']].append(acl['entry'])
+                    stats['acl_entries']['parsed'] += 1
                 else:
                     logger.warning(f"Invalid access-list at line {i}: {line}")
+                    stats['acl_entries']['skipped'] += 1
                 i += 1
             else:
                 i += 1
         except Exception as e:
             logger.error(f"Exception at line {i}: {line} | Error: {e}")
+            stats['critical_errors'] += 1
             i += 1
-    return net_objects, svc_objects, net_obj_groups, svc_obj_groups, access_lists
+    return net_objects, svc_objects, net_obj_groups, svc_obj_groups, access_lists, stats
 
 def parse_network_object(lines, idx):
     """Parse network object block."""
@@ -287,13 +310,29 @@ def write_yaml(filepath, data):
 
 def main():
     config_file = os.path.join("config", "ASA_Config.txt")
-    net_objs, svc_objs, net_obj_grps, svc_obj_grps, access_lists = parse_asa_config(config_file)
+    net_objs, svc_objs, net_obj_grps, svc_obj_grps, access_lists, stats = parse_asa_config(config_file)
     write_yaml(os.path.join("yaml", "objects_network.yaml"), net_objs)
     write_yaml(os.path.join("yaml", "objects_service.yaml"), svc_objs)
     write_yaml(os.path.join("yaml", "object-groups_network.yaml"), net_obj_grps)
     write_yaml(os.path.join("yaml", "object-groups_service.yaml"), svc_obj_grps)
     acl_yaml = [{'acl_name': name, 'entries': entries} for name, entries in access_lists.items()]
     write_yaml(os.path.join("yaml", "access-lists.yaml"), acl_yaml)
+
+    def print_summary(stats):
+        """Print summary of ASA to YAML conversion."""
+        print("\n=== ASA to YAML Conversion Summary ===")
+        print(f"Network objects:        {stats['net_objects']['parsed']} parsed, {stats['net_objects']['skipped']} skipped")
+        print(f"Service objects:        {stats['svc_objects']['parsed']} parsed, {stats['svc_objects']['skipped']} skipped")
+        print(f"Network object-groups:  {stats['net_obj_groups']['parsed']} parsed, {stats['net_obj_groups']['skipped']} skipped")
+        print(f"Service object-groups:  {stats['svc_obj_groups']['parsed']} parsed, {stats['svc_obj_groups']['skipped']} skipped")
+        print(f"Access-list entries:    {stats['acl_entries']['parsed']} parsed, {stats['acl_entries']['skipped']} skipped")
+        if stats['critical_errors']:
+            print(f"Critical errors:        {stats['critical_errors']}")
+        print("See ./log/asa2yaml.log for details on skipped/failed entries.\n")
+
+    # Exit with non-zero code if critical errors occurred
+    if stats['critical_errors'] > 0:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
