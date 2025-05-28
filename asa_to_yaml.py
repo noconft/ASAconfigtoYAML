@@ -16,19 +16,23 @@ def parse_asa_config(filepath):
         line = lines[i]
         if line.startswith("object network"):
             obj, i = parse_network_object(lines, i)
-            net_objects.append(obj)
+            if sanity_check_network_object(obj):
+                net_objects.append(obj)
         elif line.startswith("object service"):
             obj, i = parse_service_object(lines, i)
-            svc_objects.append(obj)
+            if sanity_check_service_object(obj):
+                svc_objects.append(obj)
         elif line.startswith("object-group network"):
             obj_grp, i = parse_network_object_group(lines, i)
-            net_obj_groups.append(obj_grp)
+            if sanity_check_network_object_group(obj_grp):
+                net_obj_groups.append(obj_grp)
         elif line.startswith("object-group service"):
             obj_grp, i = parse_service_object_group(lines, i)
-            svc_obj_groups.append(obj_grp)
+            if sanity_check_service_object_group(obj_grp):
+                svc_obj_groups.append(obj_grp)
         elif line.startswith("access-list"):
             acl = parse_access_list(line)
-            if acl:
+            if acl and sanity_check_acl_entry(acl['entry']):
                 access_lists[acl['acl_name']].append(acl['entry'])
             i += 1
         else:
@@ -198,6 +202,65 @@ def parse_access_list(line):
     # print("ENTRY:", entry)
     
     return {'acl_name': acl_name, 'entry': entry}
+
+# --- SANITY CHECKS ---
+
+def sanity_check_network_object(obj):
+    if 'name' not in obj or 'network_type' not in obj or 'value' not in obj:
+        return False
+    if obj['network_type'] not in ('host', 'subnet', 'range', 'fqdn'):
+        return False
+    # host must be a valid IP
+    if obj['network_type'] == 'host' and not re.match(r'^\d+\.\d+\.\d+\.\d+$', obj['value']):
+        return False
+    # subnet must be IP + mask
+    if obj['network_type'] == 'subnet':
+        parts = obj['value'].split()
+        if len(parts) != 2 or not all(re.match(r'^\d+\.\d+\.\d+\.\d+$', p) for p in parts):
+            return False
+    # range must be start-end IP
+    if obj['network_type'] == 'range' and not re.match(r'^\d+\.\d+\.\d+\.\d+-\d+\.\d+\.\d+\.\d+$', obj['value']):
+        return False
+    return True
+
+def sanity_check_service_object(obj):
+    if 'name' not in obj or 'protocol' not in obj:
+        return False
+    # protocol must be a known protocol
+    if obj['protocol'] not in ('tcp', 'udp', 'icmp', 'ip'):
+        return False
+    return True
+
+def sanity_check_network_object_group(obj_grp):
+    if 'name' not in obj_grp or 'members' not in obj_grp:
+        return False
+    if not isinstance(obj_grp['members'], list):
+        return False
+    return True
+
+def sanity_check_service_object_group(obj_grp):
+    if 'name' not in obj_grp or 'members' not in obj_grp:
+        return False
+    if not isinstance(obj_grp['members'], list):
+        return False
+    return True
+
+def sanity_check_acl_entry(entry):
+    # action must be permit or deny
+    if entry['action'] not in ('permit', 'deny'):
+        return False
+    # service type must be valid
+    s = entry['service']
+    if 'type' not in s:
+        return False
+    if s['type'] not in ('tcp', 'udp', 'icmp', 'ip', 'object', 'object-group'):
+        return False
+    # source/destination must have type and value
+    for ent in ('source', 'destination'):
+        e = entry[ent]
+        if 'type' not in e or 'value' not in e:
+            return False
+    return True
 
 def write_yaml(filepath, data):
     """Write data to YAML file, creating directories if needed."""
