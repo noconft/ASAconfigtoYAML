@@ -2,6 +2,9 @@ import re
 import yaml
 import os
 from collections import defaultdict
+from logger import get_logger  # Import the centralized logger
+
+logger = get_logger()  # Initialize the logger
 
 def parse_asa_config(filepath):
     """Parse ASA config file and extract objects, object-groups, and access-lists."""
@@ -14,28 +17,42 @@ def parse_asa_config(filepath):
     i = 0
     while i < len(lines):
         line = lines[i]
-        if line.startswith("object network"):
-            obj, i = parse_network_object(lines, i)
-            if sanity_check_network_object(obj):
-                net_objects.append(obj)
-        elif line.startswith("object service"):
-            obj, i = parse_service_object(lines, i)
-            if sanity_check_service_object(obj):
-                svc_objects.append(obj)
-        elif line.startswith("object-group network"):
-            obj_grp, i = parse_network_object_group(lines, i)
-            if sanity_check_network_object_group(obj_grp):
-                net_obj_groups.append(obj_grp)
-        elif line.startswith("object-group service"):
-            obj_grp, i = parse_service_object_group(lines, i)
-            if sanity_check_service_object_group(obj_grp):
-                svc_obj_groups.append(obj_grp)
-        elif line.startswith("access-list"):
-            acl = parse_access_list(line)
-            if acl and sanity_check_acl_entry(acl['entry']):
-                access_lists[acl['acl_name']].append(acl['entry'])
-            i += 1
-        else:
+        try:
+            if line.startswith("object network"):
+                obj, i = parse_network_object(lines, i)
+                if sanity_check_network_object(obj):
+                    net_objects.append(obj)
+                else:
+                    logger.warning(f"Invalid network object at line {i}: {obj}")
+            elif line.startswith("object service"):
+                obj, i = parse_service_object(lines, i)
+                if sanity_check_service_object(obj):
+                    svc_objects.append(obj)
+                else:
+                    logger.warning(f"Invalid service object at line {i}: {obj}")
+            elif line.startswith("object-group network"):
+                obj_grp, i = parse_network_object_group(lines, i)
+                if sanity_check_network_object_group(obj_grp):
+                    net_obj_groups.append(obj_grp)
+                else:
+                    logger.warning(f"Invalid network object-group at line {i}: {obj_grp}")
+            elif line.startswith("object-group service"):
+                obj_grp, i = parse_service_object_group(lines, i)
+                if sanity_check_service_object_group(obj_grp):
+                    svc_obj_groups.append(obj_grp)
+                else:
+                    logger.warning(f"Invalid service object-group at line {i}: {obj_grp}")
+            elif line.startswith("access-list"):
+                acl = parse_access_list(line)
+                if acl and sanity_check_acl_entry(acl['entry']):
+                    access_lists[acl['acl_name']].append(acl['entry'])
+                else:
+                    logger.warning(f"Invalid access-list at line {i}: {line}")
+                i += 1
+            else:
+                i += 1
+        except Exception as e:
+            logger.error(f"Exception at line {i}: {line} | Error: {e}")
             i += 1
     return net_objects, svc_objects, net_obj_groups, svc_obj_groups, access_lists
 
