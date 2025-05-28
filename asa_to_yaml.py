@@ -340,7 +340,7 @@ def main():
     acl_yaml = [{'acl_name': name, 'entries': entries} for name, entries in access_lists.items()]
     write_yaml(os.path.join("yaml", "access-lists.yaml"), acl_yaml)
 
-    print_summary(stats)  # <-- Now this will always run
+    print_summary(stats)
 
     # Exit with non-zero code if critical errors occurred
     if stats['critical_errors'] > 0:
