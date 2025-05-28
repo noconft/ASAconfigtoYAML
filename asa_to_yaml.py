@@ -8,17 +8,24 @@ def parse_asa_config(filepath):
     with open(filepath, encoding="utf-8") as f:
         lines = [line.rstrip() for line in f]
 
-    objects, object_groups = [], []
+    net_objects, svc_objects = [], []
+    net_obj_groups, svc_obj_groups = [], []
     access_lists = defaultdict(list)
     i = 0
     while i < len(lines):
         line = lines[i]
-        if line.startswith("object network") or line.startswith("object service"):
-            obj, i = parse_object(lines, i)
-            objects.append(obj)
-        elif line.startswith("object-group"):
-            obj_grp, i = parse_object_group(lines, i)
-            object_groups.append(obj_grp)
+        if line.startswith("object network"):
+            obj, i = parse_network_object(lines, i)
+            net_objects.append(obj)
+        elif line.startswith("object service"):
+            obj, i = parse_service_object(lines, i)
+            svc_objects.append(obj)
+        elif line.startswith("object-group network"):
+            obj_grp, i = parse_network_object_group(lines, i)
+            net_obj_groups.append(obj_grp)
+        elif line.startswith("object-group service"):
+            obj_grp, i = parse_service_object_group(lines, i)
+            svc_obj_groups.append(obj_grp)
         elif line.startswith("access-list"):
             acl = parse_access_list(line)
             if acl:
@@ -26,61 +33,83 @@ def parse_asa_config(filepath):
             i += 1
         else:
             i += 1
-    return objects, object_groups, access_lists
+    return net_objects, svc_objects, net_obj_groups, svc_obj_groups, access_lists
 
-def parse_object(lines, idx):
-    """Parse object network/service block."""
+def parse_network_object(lines, idx):
+    """Parse network object block."""
     header = lines[idx].split()
-    obj = {'name': header[-1], 'type': header[1]}
+    obj = {'name': header[-1]}
     idx += 1
     while idx < len(lines) and lines[idx].startswith(' '):
         l = lines[idx].strip()
-        if obj['type'] == 'network':
-            for t in ('host', 'range', 'subnet', 'fqdn'):
-                if l.startswith(f'{t} '):
-                    obj['network_type'] = t
-                    obj['value'] = l.split(' ', 1)[1]
-        elif obj['type'] == 'service':
-            m = re.match(r'service (\w+)(?: destination eq (\S+))?', l)
-            if m:
-                obj['protocol'] = m.group(1)
-                if m.group(2):
-                    obj['destination_port'] = m.group(2)
+        for t in ('host', 'range', 'subnet', 'fqdn'):
+            if l.startswith(f'{t} '):
+                obj['network_type'] = t
+                obj['value'] = l.split(' ', 1)[1]
         if l.startswith('description '):
             obj['description'] = l[12:]
         idx += 1
     return obj, idx
 
-def parse_object_group(lines, idx):
-    """Parse object-group block."""
+def parse_service_object(lines, idx):
+    """Parse service object block."""
     header = lines[idx].split()
-    obj_grp = {'name': header[-1], 'type': header[1], 'members': []}
+    obj = {'name': header[-1]}
+    idx += 1
+    while idx < len(lines) and lines[idx].startswith(' '):
+        l = lines[idx].strip()
+        m = re.match(r'service (\w+)(?: destination eq (\S+))?', l)
+        if m:
+            obj['protocol'] = m.group(1)
+            if m.group(2):
+                obj['destination_port'] = m.group(2)
+        if l.startswith('description '):
+            obj['description'] = l[12:]
+        idx += 1
+    return obj, idx
+
+def parse_network_object_group(lines, idx):
+    """Parse network object-group block."""
+    header = lines[idx].split()
+    obj_grp = {'name': header[-1], 'members': []}
     idx += 1
     while idx < len(lines) and lines[idx].startswith(' '):
         l = lines[idx].strip()
         if l.startswith('description '):
             obj_grp['description'] = l[12:]
-        elif obj_grp['type'] == 'service':
-            if l.startswith('service-object object '):
-                obj_grp['members'].append({'object': l.split()[-1]})
-            elif l.startswith('service-object '):
-                m = re.match(r'service-object (\w+)(?: destination eq (\S+))?', l)
-                if m:
-                    member = {'protocol': m.group(1)}
-                    if m.group(2):
-                        member['destination_port'] = m.group(2)
-                    obj_grp['members'].append(member)
-        elif obj_grp['type'] == 'network':
-            if l.startswith('group-object '):
-                obj_grp['members'].append({'group_object': l.split()[-1]})
-            elif l.startswith('network-object object '):
-                obj_grp['members'].append({'object': l.split()[-1]})
-            elif l.startswith('network-object '):
-                parts = l.split()
-                if len(parts) == 3:
-                    obj_grp['members'].append({'network_type': 'host', 'value': parts[1]})
-                elif len(parts) == 4:
-                    obj_grp['members'].append({'network_type': 'subnet', 'value': f"{parts[1]} {parts[2]}"})
+        elif l.startswith('group-object '):
+            obj_grp['members'].append({'group_object': l.split()[-1]})
+        elif l.startswith('network-object object '):
+            obj_grp['members'].append({'object': l.split()[-1]})
+        elif l.startswith('network-object '):
+            parts = l.split()
+            if len(parts) == 3:
+                obj_grp['members'].append({'network_type': 'host', 'value': parts[1]})
+            elif len(parts) == 4:
+                obj_grp['members'].append({'network_type': 'subnet', 'value': f"{parts[1]} {parts[2]}"})
+        idx += 1
+    return obj_grp, idx
+
+def parse_service_object_group(lines, idx):
+    """Parse service object-group block."""
+    header = lines[idx].split()
+    obj_grp = {'name': header[-1], 'members': []}
+    idx += 1
+    while idx < len(lines) and lines[idx].startswith(' '):
+        l = lines[idx].strip()
+        if l.startswith('description '):
+            obj_grp['description'] = l[12:]
+        elif l.startswith('group-object '):
+            obj_grp['members'].append({'group_object': l.split()[-1]})
+        elif l.startswith('service-object object '):
+            obj_grp['members'].append({'object': l.split()[-1]})
+        elif l.startswith('service-object '):
+            m = re.match(r'service-object (\w+)(?: destination eq (\S+))?', l)
+            if m:
+                member = {'protocol': m.group(1)}
+                if m.group(2):
+                    member['destination_port'] = m.group(2)
+                obj_grp['members'].append(member)
         idx += 1
     return obj_grp, idx
 
@@ -120,6 +149,8 @@ def parse_access_list(line):
         return None
     acl_name = tokens[1]
     action = tokens[3]  # Corrected: action is always at index 3 (permit/deny)
+    if action not in ('permit', 'deny'):
+        return None  # sanity check
     idx = 4
 
     # 1. Service/protocol (can be 2 tokens)
@@ -175,10 +206,12 @@ def write_yaml(filepath, data):
         yaml.dump(data, f, sort_keys=False, allow_unicode=True)
 
 def main():
-    config_file = os.path.join("config", "asa_config.txt")
-    objects, object_groups, access_lists = parse_asa_config(config_file)
-    write_yaml(os.path.join("yaml", "objects.yaml"), objects)
-    write_yaml(os.path.join("yaml", "object-groups.yaml"), object_groups)
+    config_file = os.path.join("config", "ASA_Config.txt")
+    net_objs, svc_objs, net_obj_grps, svc_obj_grps, access_lists = parse_asa_config(config_file)
+    write_yaml(os.path.join("yaml", "objects_network.yaml"), net_objs)
+    write_yaml(os.path.join("yaml", "objects_service.yaml"), svc_objs)
+    write_yaml(os.path.join("yaml", "object-groups_network.yaml"), net_obj_grps)
+    write_yaml(os.path.join("yaml", "object-groups_service.yaml"), svc_obj_grps)
     acl_yaml = [{'acl_name': name, 'entries': entries} for name, entries in access_lists.items()]
     write_yaml(os.path.join("yaml", "access-lists.yaml"), acl_yaml)
 
