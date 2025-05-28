@@ -86,10 +86,20 @@ def parse_network_object(lines, idx):
     idx += 1
     while idx < len(lines) and lines[idx].startswith(' '):
         l = lines[idx].strip()
-        for t in ('host', 'range', 'subnet', 'fqdn'):
-            if l.startswith(f'{t} '):
-                obj['network_type'] = t
-                obj['value'] = l.split(' ', 1)[1]
+        if l.startswith('host '):
+            obj['network_type'] = 'host'
+            obj['value'] = l.split(' ', 1)[1]
+        elif l.startswith('subnet '):
+            obj['network_type'] = 'subnet'
+            obj['value'] = l.split(' ', 1)[1]
+        elif l.startswith('fqdn '):
+            obj['network_type'] = 'fqdn'
+            obj['value'] = l.split(' ', 1)[1]
+        elif l.startswith('range '):
+            obj['network_type'] = 'range'
+            parts = l.split()
+            if len(parts) == 3:
+                obj['value'] = f"{parts[1]}-{parts[2]}"
         if l.startswith('description '):
             obj['description'] = l[12:]
         idx += 1
@@ -308,6 +318,18 @@ def write_yaml(filepath, data):
     with open(filepath, 'w', encoding="utf-8") as f:
         yaml.dump(data, f, sort_keys=False, allow_unicode=True)
 
+def print_summary(stats):
+    """Print summary of ASA to YAML conversion."""
+    print("\n=== ASA to YAML Conversion Summary ===")
+    print(f"Network objects:        {stats['net_objects']['parsed']} parsed, {stats['net_objects']['skipped']} skipped")
+    print(f"Service objects:        {stats['svc_objects']['parsed']} parsed, {stats['svc_objects']['skipped']} skipped")
+    print(f"Network object-groups:  {stats['net_obj_groups']['parsed']} parsed, {stats['net_obj_groups']['skipped']} skipped")
+    print(f"Service object-groups:  {stats['svc_obj_groups']['parsed']} parsed, {stats['svc_obj_groups']['skipped']} skipped")
+    print(f"Access-list entries:    {stats['acl_entries']['parsed']} parsed, {stats['acl_entries']['skipped']} skipped")
+    if stats['critical_errors']:
+        print(f"Critical errors:        {stats['critical_errors']}")
+    print("See ./log/asa2yaml.log for details on skipped/failed entries.\n")
+
 def main():
     config_file = os.path.join("config", "ASA_Config.txt")
     net_objs, svc_objs, net_obj_grps, svc_obj_grps, access_lists, stats = parse_asa_config(config_file)
@@ -318,17 +340,7 @@ def main():
     acl_yaml = [{'acl_name': name, 'entries': entries} for name, entries in access_lists.items()]
     write_yaml(os.path.join("yaml", "access-lists.yaml"), acl_yaml)
 
-    def print_summary(stats):
-        """Print summary of ASA to YAML conversion."""
-        print("\n=== ASA to YAML Conversion Summary ===")
-        print(f"Network objects:        {stats['net_objects']['parsed']} parsed, {stats['net_objects']['skipped']} skipped")
-        print(f"Service objects:        {stats['svc_objects']['parsed']} parsed, {stats['svc_objects']['skipped']} skipped")
-        print(f"Network object-groups:  {stats['net_obj_groups']['parsed']} parsed, {stats['net_obj_groups']['skipped']} skipped")
-        print(f"Service object-groups:  {stats['svc_obj_groups']['parsed']} parsed, {stats['svc_obj_groups']['skipped']} skipped")
-        print(f"Access-list entries:    {stats['acl_entries']['parsed']} parsed, {stats['acl_entries']['skipped']} skipped")
-        if stats['critical_errors']:
-            print(f"Critical errors:        {stats['critical_errors']}")
-        print("See ./log/asa2yaml.log for details on skipped/failed entries.\n")
+    print_summary(stats)  # <-- Now this will always run
 
     # Exit with non-zero code if critical errors occurred
     if stats['critical_errors'] > 0:
