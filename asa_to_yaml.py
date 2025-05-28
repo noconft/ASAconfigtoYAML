@@ -63,6 +63,10 @@ def parse_asa_config(filepath):
                     logger.warning(f"Invalid service object-group at line {i}: {obj_grp}")
                     stats['svc_obj_groups']['skipped'] += 1
             elif line.startswith("access-list"):
+                # Ignore ACL remarks
+                if "remark" in line:
+                    i += 1
+                    continue
                 acl = parse_access_list(line)
                 if acl and sanity_check_acl_entry(acl['entry']):
                     access_lists[acl['acl_name']].append(acl['entry'])
