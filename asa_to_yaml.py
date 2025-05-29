@@ -316,9 +316,11 @@ def sanity_check_acl_entry(entry):
             return False
     return True
 
-def write_yaml(filepath, data):
-    """Write data to YAML file, creating directories if needed."""
+def write_yaml(filepath, data, top_level_key=None):
+    """Write data to YAML file, creating directories if needed, with optional top-level key."""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    if top_level_key:
+        data = {top_level_key: data}
     with open(filepath, 'w', encoding="utf-8") as f:
         yaml.dump(data, f, sort_keys=False, allow_unicode=True)
 
@@ -335,14 +337,14 @@ def print_summary(stats):
     print("See ./log/asa2yaml.log for details on skipped/failed entries.\n")
 
 def main():
-    config_file = os.path.join("config", "ASA_Config.txt")
+    config_file = os.path.join("config", "sample_asa_config.txt")
     net_objs, svc_objs, net_obj_grps, svc_obj_grps, access_lists, stats = parse_asa_config(config_file)
-    write_yaml(os.path.join("yaml", "objects_network.yaml"), net_objs)
-    write_yaml(os.path.join("yaml", "objects_service.yaml"), svc_objs)
-    write_yaml(os.path.join("yaml", "object-groups_network.yaml"), net_obj_grps)
-    write_yaml(os.path.join("yaml", "object-groups_service.yaml"), svc_obj_grps)
+    write_yaml(os.path.join("yaml", "objects_network.yaml"), net_objs, top_level_key="network_objects")
+    write_yaml(os.path.join("yaml", "objects_service.yaml"), svc_objs, top_level_key="service_objects")
+    write_yaml(os.path.join("yaml", "object-groups_network.yaml"), net_obj_grps, top_level_key="network_object_groups")
+    write_yaml(os.path.join("yaml", "object-groups_service.yaml"), svc_obj_grps, top_level_key="service_object_groups")
     acl_yaml = [{'acl_name': name, 'entries': entries} for name, entries in access_lists.items()]
-    write_yaml(os.path.join("yaml", "access-lists.yaml"), acl_yaml)
+    write_yaml(os.path.join("yaml", "access-lists.yaml"), acl_yaml, top_level_key="access_lists")
 
     print_summary(stats)
 

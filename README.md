@@ -14,9 +14,7 @@ Intended as the first step in migrating ASA configs to other firewall platforms 
 ## Usage
 
 1. Place your ASA config file in the `config/` directory (e.g., `config/asa_config.txt`).
-2. Run the main script:
-
-<pre> ```bash python asa_to_yaml.py ``` </pre>
+2. Run the main script `python asa_to_yaml.py` in your terminal.
 
 3. YAML files will be generated in the `yaml/` directory.
 4. Check the summary in the terminal and details in `log/asa2yaml.log`.
