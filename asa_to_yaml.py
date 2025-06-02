@@ -2,6 +2,7 @@ import re
 import yaml
 import os
 import sys
+import ipaddress  # <-- Added for IP validation
 from collections import defaultdict
 from logger import get_logger  # Import the centralized logger
 
@@ -13,7 +14,7 @@ def parse_asa_config(filepath):
         lines = [line.rstrip() for line in f]
 
     net_objects, svc_objects = [], []
-    net_obj_groups, svc_obj_groups = [], []
+    net_object_groups, svc_object_groups = [], []
     access_lists = defaultdict(list)
 
     # Stats for summary
@@ -49,7 +50,7 @@ def parse_asa_config(filepath):
             elif line.startswith("object-group network"):
                 obj_grp, i = parse_network_object_group(lines, i)
                 if sanity_check_network_object_group(obj_grp):
-                    net_obj_groups.append(obj_grp)
+                    net_object_groups.append(obj_grp)
                     stats['net_obj_groups']['parsed'] += 1
                 else:
                     logger.warning(f"Invalid network object-group at line {i}: {obj_grp}")
@@ -57,7 +58,7 @@ def parse_asa_config(filepath):
             elif line.startswith("object-group service"):
                 obj_grp, i = parse_service_object_group(lines, i)
                 if sanity_check_service_object_group(obj_grp):
-                    svc_obj_groups.append(obj_grp)
+                    svc_object_groups.append(obj_grp)
                     stats['svc_obj_groups']['parsed'] += 1
                 else:
                     logger.warning(f"Invalid service object-group at line {i}: {obj_grp}")
@@ -81,7 +82,7 @@ def parse_asa_config(filepath):
             logger.error(f"Exception at line {i}: {line} | Error: {e}")
             stats['critical_errors'] += 1
             i += 1
-    return net_objects, svc_objects, net_obj_groups, svc_obj_groups, access_lists, stats
+    return net_objects, svc_objects, net_object_groups, svc_object_groups, access_lists, stats
 
 def parse_network_object(lines, idx):
     """Parse network object block."""
@@ -91,19 +92,38 @@ def parse_network_object(lines, idx):
     while idx < len(lines) and lines[idx].startswith(' '):
         l = lines[idx].strip()
         if l.startswith('host '):
-            obj['network_type'] = 'host'
-            obj['value'] = l.split(' ', 1)[1]
+            ip = l.split(' ', 1)[1]
+            try:
+                ipaddress.ip_address(ip)  # Validate
+                obj['type'] = 'host'
+                obj['ip_address'] = ip
+            except ValueError:
+                logger.warning(f"Invalid host IP address: {ip}")
         elif l.startswith('subnet '):
-            obj['network_type'] = 'subnet'
-            obj['value'] = l.split(' ', 1)[1]
-        elif l.startswith('fqdn '):
-            obj['network_type'] = 'fqdn'
-            obj['value'] = l.split(' ', 1)[1]
-        elif l.startswith('range '):
-            obj['network_type'] = 'range'
             parts = l.split()
             if len(parts) == 3:
-                obj['value'] = f"{parts[1]}-{parts[2]}"
+                network, netmask = parts[1], parts[2]
+                try:
+                    ipaddress.IPv4Network(f"{network}/{netmask}")
+                    obj['type'] = 'subnet'
+                    obj['network'] = network
+                    obj['netmask'] = netmask
+                except ValueError:
+                    logger.warning(f"Invalid subnet: {network} {netmask}")
+        elif l.startswith('fqdn '):
+            obj['type'] = 'fqdn'
+            obj['fqdn'] = l.split(' ', 1)[1]
+        elif l.startswith('range '):
+            parts = l.split()
+            if len(parts) == 3:
+                start, end = parts[1], parts[2]
+                try:
+                    ipaddress.ip_address(start)
+                    ipaddress.ip_address(end)
+                    obj['type'] = 'range'
+                    obj['ip_range'] = {'start': start, 'end': end}
+                except ValueError:
+                    logger.warning(f"Invalid IP range: {start} {end}")
         if l.startswith('description '):
             obj['description'] = l[12:]
         idx += 1
@@ -116,11 +136,19 @@ def parse_service_object(lines, idx):
     idx += 1
     while idx < len(lines) and lines[idx].startswith(' '):
         l = lines[idx].strip()
-        m = re.match(r'service (\w+)(?: destination eq (\S+))?', l)
-        if m:
-            obj['protocol'] = m.group(1)
-            if m.group(2):
-                obj['destination_port'] = m.group(2)
+        # eq (single port)
+        m_eq = re.match(r'service (\w+) destination eq (\d+)', l)
+        # range (port range)
+        m_range = re.match(r'service (\w+) destination range (\d+) (\d+)', l)
+        if m_eq:
+            obj['protocol'] = m_eq.group(1)
+            obj['destination_port'] = int(m_eq.group(2))
+        elif m_range:
+            obj['protocol'] = m_range.group(1)
+            obj['destination_port_range'] = {
+                'start': int(m_range.group(2)),
+                'end': int(m_range.group(3))
+            }
         if l.startswith('description '):
             obj['description'] = l[12:]
         idx += 1
@@ -136,15 +164,34 @@ def parse_network_object_group(lines, idx):
         if l.startswith('description '):
             obj_grp['description'] = l[12:]
         elif l.startswith('group-object '):
-            obj_grp['members'].append({'group_object': l.split()[-1]})
+            obj_grp['members'].append({'type': 'group_object', 'name': l.split()[-1]})
         elif l.startswith('network-object object '):
-            obj_grp['members'].append({'object': l.split()[-1]})
+            obj_grp['members'].append({'type': 'object', 'name': l.split()[-1]})
+        elif l.startswith('network-object host '):
+            ip = l.split()[-1]
+            try:
+                ipaddress.ip_address(ip)
+                obj_grp['members'].append({'type': 'host', 'ip_address': ip})
+            except ValueError:
+                logger.warning(f"Invalid host IP in group: {ip}")
         elif l.startswith('network-object '):
             parts = l.split()
-            if len(parts) == 3:
-                obj_grp['members'].append({'network_type': 'host', 'value': parts[1]})
-            elif len(parts) == 4:
-                obj_grp['members'].append({'network_type': 'subnet', 'value': f"{parts[1]} {parts[2]}"})
+            # subnet
+            if len(parts) == 3 and re.match(r'\d+\.\d+\.\d+\.\d+', parts[1]) and re.match(r'\d+\.\d+\.\d+\.\d+', parts[2]):
+                network, netmask = parts[1], parts[2]
+                try:
+                    ipaddress.IPv4Network(f"{network}/{netmask}")
+                    obj_grp['members'].append({'type': 'subnet', 'network': network, 'netmask': netmask})
+                except ValueError:
+                    logger.warning(f"Invalid subnet in group: {network} {netmask}")
+            # host
+            elif len(parts) == 2 and re.match(r'\d+\.\d+\.\d+\.\d+', parts[1]):
+                ip = parts[1]
+                try:
+                    ipaddress.ip_address(ip)
+                    obj_grp['members'].append({'type': 'host', 'ip_address': ip})
+                except ValueError:
+                    logger.warning(f"Invalid host IP in group: {ip}")
         idx += 1
     return obj_grp, idx
 
@@ -158,16 +205,23 @@ def parse_service_object_group(lines, idx):
         if l.startswith('description '):
             obj_grp['description'] = l[12:]
         elif l.startswith('group-object '):
-            obj_grp['members'].append({'group_object': l.split()[-1]})
+            obj_grp['members'].append({'type': 'group_object', 'name': l.split()[-1]})
         elif l.startswith('service-object object '):
-            obj_grp['members'].append({'object': l.split()[-1]})
+            obj_grp['members'].append({'type': 'object', 'name': l.split()[-1]})
         elif l.startswith('service-object '):
-            m = re.match(r'service-object (\w+)(?: destination eq (\S+))?', l)
-            if m:
-                member = {'protocol': m.group(1)}
-                if m.group(2):
-                    member['destination_port'] = m.group(2)
-                obj_grp['members'].append(member)
+            # eq (single port)
+            m_eq = re.match(r'service-object (\w+) destination eq (\d+)', l)
+            # range (port range)
+            m_range = re.match(r'service-object (\w+) destination range (\d+) (\d+)', l)
+            if m_eq:
+                obj_grp['members'].append({'type': 'port', 'protocol': m_eq.group(1), 'value': int(m_eq.group(2))})
+            elif m_range:
+                obj_grp['members'].append({
+                    'type': 'port_range',
+                    'protocol': m_range.group(1),
+                    'start': int(m_range.group(2)),
+                    'end': int(m_range.group(3))
+                })
         idx += 1
     return obj_grp, idx
 
@@ -179,18 +233,17 @@ def parse_acl_entity(tokens, idx):
     # any
     if t == 'any':
         return {'type': 'any', 'value': 'any'}, idx + 1
-    # host <ip>
+    # host
     if t == 'host' and idx + 1 < len(tokens):
-        return {'type': 'host', 'value': tokens[idx + 1]}, idx + 2
+        return {'type': 'host', 'ip_address': tokens[idx + 1]}, idx + 2
     # object/object-group <name>
     if t in ('object', 'object-group') and idx + 1 < len(tokens):
-        return {'type': t, 'value': tokens[idx + 1]}, idx + 2
-    # <ip> <mask> (subnet)
+        return {'type': t, 'name': tokens[idx + 1]}, idx + 2
+    # subnet
     if re.match(r'\d+\.\d+\.\d+\.\d+', t):
         if idx + 1 < len(tokens) and re.match(r'\d+\.\d+\.\d+\.\d+', tokens[idx + 1]):
-            return {'type': 'subnet', 'value': f"{t} {tokens[idx + 1]}"}, idx + 2
-        return {'type': 'host', 'value': t}, idx + 1
-    # fallback
+            return {'type': 'subnet', 'network': t, 'netmask': tokens[idx + 1]}, idx + 2
+        return {'type': 'host', 'ip_address': t}, idx + 1
     return {'type': 'unknown', 'value': t}, idx + 1
 
 def parse_access_list(line):
@@ -206,7 +259,7 @@ def parse_access_list(line):
     if len(tokens) < 6 or tokens[2] != 'extended':
         return None
     acl_name = tokens[1]
-    action = tokens[3]  # Corrected: action is always at index 3 (permit/deny)
+    action = tokens[3]
     if action not in ('permit', 'deny'):
         return None  # sanity check
     idx = 4
@@ -220,7 +273,7 @@ def parse_access_list(line):
         port_after = True
     elif proto_token in ('object', 'object-group'):
         service['type'] = proto_token
-        service['value'] = tokens[idx + 1]
+        service['name'] = tokens[idx + 1]
         idx += 2
         port_after = False
     else:
@@ -233,15 +286,17 @@ def parse_access_list(line):
     # 3. Destination (can be 2 tokens)
     destination, idx = parse_acl_entity(tokens, idx)
 
-    # 4. Port (for tcp/udp, after destination)
-    port = None
+    # Port (for tcp/udp, after destination)
     if port_after and service['type'] in ('tcp', 'udp') and idx < len(tokens):
         if tokens[idx] == 'eq' and idx + 1 < len(tokens):
-            port = tokens[idx + 1]
+            service['destination_port'] = int(tokens[idx + 1])
             idx += 2
-
-    if port:
-        service['port'] = port
+        elif tokens[idx] == 'range' and idx + 2 < len(tokens):
+            service['destination_port_range'] = {
+                'start': int(tokens[idx + 1]),
+                'end': int(tokens[idx + 2])
+            }
+            idx += 3
 
     entry = {
         'source': source,
@@ -260,20 +315,29 @@ def parse_access_list(line):
 # --- SANITY CHECKS ---
 
 def sanity_check_network_object(obj):
-    if 'name' not in obj or 'network_type' not in obj or 'value' not in obj:
+    if 'name' not in obj or 'type' not in obj:
         return False
-    if obj['network_type'] not in ('host', 'subnet', 'range', 'fqdn'):
-        return False
-    # host must be a valid IP
-    if obj['network_type'] == 'host' and not re.match(r'^\d+\.\d+\.\d+\.\d+$', obj['value']):
-        return False
-    # subnet must be IP + mask
-    if obj['network_type'] == 'subnet':
-        parts = obj['value'].split()
-        if len(parts) != 2 or not all(re.match(r'^\d+\.\d+\.\d+\.\d+$', p) for p in parts):
+    if obj['type'] == 'host':
+        ip = obj.get('ip_address')
+        try:
+            ipaddress.ip_address(ip)
+        except Exception:
             return False
-    # range must be start-end IP
-    if obj['network_type'] == 'range' and not re.match(r'^\d+\.\d+\.\d+\.\d+-\d+\.\d+\.\d+\.\d+$', obj['value']):
+    if obj['type'] == 'subnet':
+        network = obj.get('network')
+        netmask = obj.get('netmask')
+        try:
+            ipaddress.IPv4Network(f"{network}/{netmask}")
+        except Exception:
+            return False
+    if obj['type'] == 'range':
+        ipr = obj.get('ip_range', {})
+        try:
+            ipaddress.ip_address(ipr.get('start'))
+            ipaddress.ip_address(ipr.get('end'))
+        except Exception:
+            return False
+    if obj['type'] == 'fqdn' and 'fqdn' not in obj:
         return False
     return True
 
@@ -303,16 +367,39 @@ def sanity_check_acl_entry(entry):
     # action must be permit or deny
     if entry['action'] not in ('permit', 'deny'):
         return False
-    # service type must be valid
     s = entry['service']
     if 'type' not in s:
         return False
     if s['type'] not in ('tcp', 'udp', 'icmp', 'ip', 'object', 'object-group'):
         return False
-    # source/destination must have type and value
-    for ent in ('source', 'destination'):
-        e = entry[ent]
-        if 'type' not in e or 'value' not in e:
+    # Check source and destination
+    for endpoint in ('source', 'destination'):
+        ep = entry.get(endpoint, {})
+        t = ep.get('type')
+        if t == 'host':
+            ip = ep.get('ip_address')
+            try:
+                ipaddress.ip_address(ip)
+            except Exception:
+                return False
+        elif t == 'subnet':
+            network = ep.get('network')
+            netmask = ep.get('netmask')
+            try:
+                ipaddress.IPv4Network(f"{network}/{netmask}")
+            except Exception:
+                return False
+        elif t == 'range':
+            ipr = ep.get('ip_range', {})
+            try:
+                ipaddress.ip_address(ipr.get('start'))
+                ipaddress.ip_address(ipr.get('end'))
+            except Exception:
+                return False
+        elif t in ('object', 'object-group', 'any', 'group_object', 'unknown'):
+            # These are references or special types, skip IP validation
+            continue
+        else:
             return False
     return True
 
@@ -338,11 +425,11 @@ def print_summary(stats):
 
 def main():
     config_file = os.path.join("config", "sample_asa_config.txt")
-    net_objs, svc_objs, net_obj_grps, svc_obj_grps, access_lists, stats = parse_asa_config(config_file)
-    write_yaml(os.path.join("yaml", "objects_network.yaml"), net_objs, top_level_key="network_objects")
-    write_yaml(os.path.join("yaml", "objects_service.yaml"), svc_objs, top_level_key="service_objects")
-    write_yaml(os.path.join("yaml", "object-groups_network.yaml"), net_obj_grps, top_level_key="network_object_groups")
-    write_yaml(os.path.join("yaml", "object-groups_service.yaml"), svc_obj_grps, top_level_key="service_object_groups")
+    net_objects, svc_objects, net_object_groups, svc_object_groups, access_lists, stats = parse_asa_config(config_file)
+    write_yaml(os.path.join("yaml", "objects_network.yaml"), net_objects, top_level_key="network_objects")
+    write_yaml(os.path.join("yaml", "objects_service.yaml"), svc_objects, top_level_key="service_objects")
+    write_yaml(os.path.join("yaml", "object-groups_network.yaml"), net_object_groups, top_level_key="network_object_groups")
+    write_yaml(os.path.join("yaml", "object-groups_service.yaml"), svc_object_groups, top_level_key="service_object_groups")
     acl_yaml = [{'acl_name': name, 'entries': entries} for name, entries in access_lists.items()]
     write_yaml(os.path.join("yaml", "access-lists.yaml"), acl_yaml, top_level_key="access_lists")
 
