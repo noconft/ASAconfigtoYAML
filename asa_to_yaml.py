@@ -2,9 +2,10 @@ import re
 import yaml
 import os
 import sys
-import ipaddress  # <-- Added for IP validation
+import ipaddress 
 from collections import defaultdict
 from logger import get_logger  # Import the centralized logger
+from service_name_to_port import SERVICE_NAME_TO_PORT
 
 logger = get_logger()  # Initialize the logger
 
@@ -129,26 +130,62 @@ def parse_network_object(lines, idx):
         idx += 1
     return obj, idx
 
+def translate_service_name_to_port(port):
+    """Translate ASA service name to port number if possible, else return original."""
+    if isinstance(port, int):
+        return port
+    if isinstance(port, str):
+        # Normalize: strip, lower, replace multiple spaces with single, replace spaces with dash/underscore
+        port_norm = re.sub(r'\s+', '-', port.strip().lower())
+        # Try direct int
+        try:
+            return int(port_norm)
+        except ValueError:
+            # Try direct lookup
+            if port_norm in SERVICE_NAME_TO_PORT:
+                return SERVICE_NAME_TO_PORT[port_norm]
+            # Try with underscores (for some mappings)
+            port_us = port_norm.replace('-', '_')
+            if port_us in SERVICE_NAME_TO_PORT:
+                return SERVICE_NAME_TO_PORT[port_us]
+            # Try with spaces removed
+            port_nospace = port_norm.replace('-', '')
+            if port_nospace in SERVICE_NAME_TO_PORT:
+                return SERVICE_NAME_TO_PORT[port_nospace]
+            logger.warning(f"Unknown service name '{port}' (normalized: '{port_norm}') encountered; leaving as string.")
+            return port
+    return port
+
 def parse_service_object(lines, idx):
-    """Parse service object block."""
+    """Parse service object block, supporting multi-token service names and ports."""
     header = lines[idx].split()
     obj = {'name': header[-1]}
     idx += 1
     while idx < len(lines) and lines[idx].startswith(' '):
         l = lines[idx].strip()
-        # eq (single port)
-        m_eq = re.match(r'service (\w+) destination eq (\d+)', l)
-        # range (port range)
-        m_range = re.match(r'service (\w+) destination range (\d+) (\d+)', l)
-        if m_eq:
-            obj['protocol'] = m_eq.group(1)
-            obj['destination_port'] = int(m_eq.group(2))
-        elif m_range:
-            obj['protocol'] = m_range.group(1)
-            obj['destination_port_range'] = {
-                'start': int(m_range.group(2)),
-                'end': int(m_range.group(3))
-            }
+        # Support multi-token service names and ports
+        if l.startswith('service '):
+            # Split on 'destination eq' or 'destination range'
+            if 'destination eq' in l:
+                pre, post = l.split('destination eq', 1)
+                proto = pre.replace('service', '').strip()
+                port = post.strip()
+                obj['protocol'] = proto
+                obj['destination_port'] = translate_service_name_to_port(port)
+            elif 'destination range' in l:
+                pre, post = l.split('destination range', 1)
+                proto = pre.replace('service', '').strip()
+                # The post part may have multi-token start and end ports
+                # Try to split only on the first space
+                parts = post.strip().split()
+                if len(parts) >= 2:
+                    start = parts[0]
+                    end = ' '.join(parts[1:])
+                    obj['protocol'] = proto
+                    obj['destination_port_range'] = {
+                        'start': translate_service_name_to_port(start),
+                        'end': translate_service_name_to_port(end)
+                    }
         if l.startswith('description '):
             obj['description'] = l[12:]
         idx += 1
@@ -209,18 +246,21 @@ def parse_service_object_group(lines, idx):
         elif l.startswith('service-object object '):
             obj_grp['members'].append({'type': 'object', 'name': l.split()[-1]})
         elif l.startswith('service-object '):
-            # eq (single port)
-            m_eq = re.match(r'service-object (\w+) destination eq (\d+)', l)
-            # range (port range)
-            m_range = re.match(r'service-object (\w+) destination range (\d+) (\d+)', l)
+            # eq (allow spaces and special chars in port name)
+            m_eq = re.match(r'service-object ([\w\-_.:/+]+) destination eq (.+)', l)
+            # range (allow spaces and special chars in port names)
+            m_range = re.match(r'service-object ([\w\-_.:/+]+) destination range (.+) (.+)', l)
             if m_eq:
-                obj_grp['members'].append({'type': 'port', 'protocol': m_eq.group(1), 'value': int(m_eq.group(2))})
+                port = m_eq.group(2).strip()
+                obj_grp['members'].append({'type': 'port', 'protocol': m_eq.group(1), 'value': translate_service_name_to_port(port)})
             elif m_range:
+                start = m_range.group(2).strip()
+                end = m_range.group(3).strip()
                 obj_grp['members'].append({
                     'type': 'port_range',
                     'protocol': m_range.group(1),
-                    'start': int(m_range.group(2)),
-                    'end': int(m_range.group(3))
+                    'start': translate_service_name_to_port(start),
+                    'end': translate_service_name_to_port(end)
                 })
         idx += 1
     return obj_grp, idx
@@ -252,10 +292,6 @@ def parse_access_list(line):
     Handles all ASA ACL forms: protocol/service, source, destination, port (if present).
     """
     tokens = line.split()
-    ### Debugging output
-    # print("DEBUG LINE:", line)
-    # print("TOKENS:", tokens)
-    
     if len(tokens) < 6 or tokens[2] != 'extended':
         return None
     acl_name = tokens[1]
@@ -288,13 +324,24 @@ def parse_access_list(line):
 
     # Port (for tcp/udp, after destination)
     if port_after and service['type'] in ('tcp', 'udp') and idx < len(tokens):
-        if tokens[idx] == 'eq' and idx + 1 < len(tokens):
-            service['destination_port'] = int(tokens[idx + 1])
-            idx += 2
-        elif tokens[idx] == 'range' and idx + 2 < len(tokens):
+        # eq or range, allow multi-token port names
+        if tokens[idx] == 'eq':
+            # Collect all tokens after 'eq' as port name (could be multi-word)
+            port_tokens = []
+            j = idx + 1
+            while j < len(tokens) and not tokens[j] in ('log', 'inactive', 'time-range', 'established'):
+                port_tokens.append(tokens[j])
+                j += 1
+            port = ' '.join(port_tokens)
+            service['destination_port'] = translate_service_name_to_port(port)
+            idx = j
+        elif tokens[idx] == 'range':
+            # Collect start and end (could be multi-word, but usually 2 tokens)
+            start = tokens[idx + 1]
+            end = tokens[idx + 2]
             service['destination_port_range'] = {
-                'start': int(tokens[idx + 1]),
-                'end': int(tokens[idx + 2])
+                'start': translate_service_name_to_port(start),
+                'end': translate_service_name_to_port(end)
             }
             idx += 3
 
@@ -304,12 +351,6 @@ def parse_access_list(line):
         'service': service,
         'action': action
     }
-    ### Debugging output
-    # print("SERVICE:", service)
-    # print("SOURCE:", source)
-    # print("DESTINATION:", destination)
-    # print("ENTRY:", entry)
-    
     return {'acl_name': acl_name, 'entry': entry}
 
 # --- SANITY CHECKS ---
