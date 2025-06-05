@@ -3,20 +3,13 @@ import yaml
 import os
 import sys
 import ipaddress
-import datetime
 from collections import defaultdict
 from logger import get_logger
 from service_name_to_port import SERVICE_NAME_TO_PORT
 from asa_icmp_type_map import ASA_ICMP_TYPE_MAP
 from typing import Any, Dict, List, Optional, Tuple
 
-class AsaYamlParseError(Exception):
-    """Custom exception for ASA to YAML parsing errors."""
-    pass
-
 logger = get_logger()
-
-ERROR_REPORT_PATH = os.path.join("log", "error_report_asa.yaml")
 
 # --- Utility Functions ---
 def translate_service_name_to_port(port: Any, protocol: Optional[str] = None) -> Any:
@@ -25,7 +18,6 @@ def translate_service_name_to_port(port: Any, protocol: Optional[str] = None) ->
     For ICMP, map type name to (type, code) if possible.
     """
     if protocol and protocol.lower() == 'icmp':
-        # For ICMP, ASA config only accepts exact names as in the mapping
         if isinstance(port, str):
             if port in ASA_ICMP_TYPE_MAP:
                 return ASA_ICMP_TYPE_MAP[port]
@@ -35,7 +27,6 @@ def translate_service_name_to_port(port: Any, protocol: Optional[str] = None) ->
     if isinstance(port, int):
         return port
     if isinstance(port, str):
-        # Use port name as-is for lookup
         try:
             return int(port)
         except ValueError:
@@ -46,16 +37,11 @@ def translate_service_name_to_port(port: Any, protocol: Optional[str] = None) ->
     return port
 
 def extract_description(line: str) -> str:
-    """
-    Extract description from a config line if present.
-    Returns the description string or an empty string if not present.
-    """
+    """Extract description from a config line if present."""
     return line[12:] if line.startswith('description ') else ''
 
 def append_group_member(members: List[dict], member: dict) -> None:
-    """
-    Append a member to a group, avoiding duplicates.
-    """
+    """Append a member to a group, avoiding duplicates."""
     if member not in members:
         members.append(member)
 
@@ -85,35 +71,38 @@ def parse_asa_config(filepath: str) -> Tuple[List[dict], List[dict], List[dict],
                 if sanity_check_network_object(obj):
                     net_objects.append(obj)
                     stats['net_objects']['parsed'] += 1
-                else:
-                    logger.warning(f"Invalid network object at line {i}: {obj}")
-                    stats['net_objects']['skipped'] += 1
-            elif line.startswith("object service"):
+                    continue
+                logger.warning(f"Invalid network object at line {i}: {obj}")
+                stats['net_objects']['skipped'] += 1
+                continue
+            if line.startswith("object service"):
                 obj, i = parse_service_object(lines, i)
                 if sanity_check_service_object(obj):
                     svc_objects.append(obj)
                     stats['svc_objects']['parsed'] += 1
-                else:
-                    logger.warning(f"Invalid service object at line {i}: {obj}")
-                    stats['svc_objects']['skipped'] += 1
-            elif line.startswith("object-group network"):
+                    continue
+                logger.warning(f"Invalid service object at line {i}: {obj}")
+                stats['svc_objects']['skipped'] += 1
+                continue
+            if line.startswith("object-group network"):
                 obj_grp, i = parse_network_object_group(lines, i)
                 if sanity_check_network_object_group(obj_grp):
                     net_object_groups.append(obj_grp)
                     stats['net_obj_groups']['parsed'] += 1
-                else:
-                    logger.warning(f"Invalid network object-group at line {i}: {obj_grp}")
-                    stats['net_obj_groups']['skipped'] += 1
-            elif line.startswith("object-group service"):
+                    continue
+                logger.warning(f"Invalid network object-group at line {i}: {obj_grp}")
+                stats['net_obj_groups']['skipped'] += 1
+                continue
+            if line.startswith("object-group service"):
                 obj_grp, i = parse_service_object_group(lines, i)
                 if sanity_check_service_object_group(obj_grp):
                     svc_object_groups.append(obj_grp)
                     stats['svc_obj_groups']['parsed'] += 1
-                else:
-                    logger.warning(f"Invalid service object-group at line {i}: {obj_grp}")
-                    stats['svc_obj_groups']['skipped'] += 1
-            elif line.startswith("access-list"):
-                # Ignore ACL remarks
+                    continue
+                logger.warning(f"Invalid service object-group at line {i}: {obj_grp}")
+                stats['svc_obj_groups']['skipped'] += 1
+                continue
+            if line.startswith("access-list"):
                 if "remark" in line:
                     i += 1
                     continue
@@ -121,12 +110,13 @@ def parse_asa_config(filepath: str) -> Tuple[List[dict], List[dict], List[dict],
                 if acl and sanity_check_acl_entry(acl['entry']):
                     access_lists[acl['acl_name']].append(acl['entry'])
                     stats['acl_entries']['parsed'] += 1
-                else:
-                    logger.warning(f"Invalid access-list at line {i}: {line}")
-                    stats['acl_entries']['skipped'] += 1
+                    i += 1
+                    continue
+                logger.warning(f"Invalid access-list at line {i}: {line}")
+                stats['acl_entries']['skipped'] += 1
                 i += 1
-            else:
-                i += 1
+                continue
+            i += 1
         except Exception as e:
             logger.error(f"Exception at line {i}: {line} | Error: {e}")
             stats['critical_errors'] += 1
@@ -561,7 +551,6 @@ def main() -> None:
     """
     Main entry point for ASA to YAML conversion.
     Parses config, writes YAML, prints summary, and exits with error code if needed.
-    Also writes a structured error report to log/error_report_asa.yaml.
     """
     config_file = os.path.join("config", "sample_asa_config.txt")
     net_objects, svc_objects, net_object_groups, svc_object_groups, access_lists, stats = parse_asa_config(config_file)
@@ -574,25 +563,6 @@ def main() -> None:
 
     print_summary(stats)
 
-    # Write structured error report
-    error_report = {
-        'timestamp': datetime.datetime.now().isoformat(),
-        'critical_errors': stats.get('critical_errors', 0),
-        'skipped': {
-            'network_objects': stats['net_objects']['skipped'],
-            'service_objects': stats['svc_objects']['skipped'],
-            'network_object_groups': stats['net_obj_groups']['skipped'],
-            'service_object_groups': stats['svc_obj_groups']['skipped'],
-            'acl_entries': stats['acl_entries']['skipped'],
-        }
-    }
-    try:
-        write_yaml(ERROR_REPORT_PATH, error_report)
-        logger.info(f"Error report written to {ERROR_REPORT_PATH}")
-    except Exception as e:
-        logger.error(f"Failed to write error report: {e}")
-
-    # Exit with non-zero code if critical errors occurred
     if stats['critical_errors'] > 0:
         sys.exit(1)
 
