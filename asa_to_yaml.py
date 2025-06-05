@@ -3,16 +3,25 @@ import yaml
 import os
 import sys
 import ipaddress
+import datetime
 from collections import defaultdict
 from logger import get_logger
 from service_name_to_port import SERVICE_NAME_TO_PORT
 from asa_icmp_type_map import ASA_ICMP_TYPE_MAP
+from typing import Any, Dict, List, Optional, Tuple
+
+class AsaYamlParseError(Exception):
+    """Custom exception for ASA to YAML parsing errors."""
+    pass
 
 logger = get_logger()
 
+ERROR_REPORT_PATH = os.path.join("log", "error_report_asa.yaml")
+
 # --- Utility Functions ---
-def translate_service_name_to_port(port, protocol=None):
-    """Translate ASA service name to port number if possible, else return original.
+def translate_service_name_to_port(port: Any, protocol: Optional[str] = None) -> Any:
+    """
+    Translate ASA service name to port number if possible, else return original.
     For ICMP, map type name to (type, code) if possible.
     """
     if protocol and protocol.lower() == 'icmp':
@@ -36,9 +45,26 @@ def translate_service_name_to_port(port, protocol=None):
             return port
     return port
 
+def extract_description(line: str) -> str:
+    """
+    Extract description from a config line if present.
+    Returns the description string or an empty string if not present.
+    """
+    return line[12:] if line.startswith('description ') else ''
+
+def append_group_member(members: List[dict], member: dict) -> None:
+    """
+    Append a member to a group, avoiding duplicates.
+    """
+    if member not in members:
+        members.append(member)
+
 # --- Parsing Functions ---
-def parse_asa_config(filepath):
-    """Parse ASA config file and extract objects, object-groups, and access-lists."""
+def parse_asa_config(filepath: str) -> Tuple[List[dict], List[dict], List[dict], List[dict], Dict[str, List[dict]], dict]:
+    """
+    Parse ASA config file and extract objects, object-groups, and access-lists.
+    Returns all parsed objects, object-groups, access-lists, and stats.
+    """
     with open(filepath, encoding="utf-8") as f:
         lines = [line.rstrip() for line in f]
 
@@ -107,8 +133,11 @@ def parse_asa_config(filepath):
             i += 1
     return net_objects, svc_objects, net_object_groups, svc_object_groups, access_lists, stats
 
-def parse_network_object(lines, idx):
-    """Parse network object block."""
+def parse_network_object(lines: List[str], idx: int) -> Tuple[dict, int]:
+    """
+    Parse network object block from ASA config lines.
+    Returns the parsed object and the next line index.
+    """
     header = lines[idx].split()
     obj = {'name': header[-1]}
     idx += 1
@@ -147,12 +176,17 @@ def parse_network_object(lines, idx):
                     obj['ip_range'] = {'start': start, 'end': end}
                 except ValueError:
                     logger.warning(f"Invalid IP range: {start} {end}")
-        if l.startswith('description '):
-            obj['description'] = l[12:]
+        desc = extract_description(l)
+        if desc:
+            obj['description'] = desc
         idx += 1
     return obj, idx
 
-def parse_service_object(lines, idx):
+def parse_service_object(lines: List[str], idx: int) -> Tuple[dict, int]:
+    """
+    Parse service object block from ASA config lines.
+    Returns the parsed object and the next line index.
+    """
     header = lines[idx].split()
     obj = {'name': header[-1]}
     idx += 1
@@ -204,29 +238,34 @@ def parse_service_object(lines, idx):
                             'start': translate_service_name_to_port(start),
                             'end': translate_service_name_to_port(end)
                         }
-        if l.startswith('description '):
-            obj['description'] = l[12:]
+        desc = extract_description(l)
+        if desc:
+            obj['description'] = desc
         idx += 1
     return obj, idx
 
-def parse_network_object_group(lines, idx):
-    """Parse network object-group block."""
+def parse_network_object_group(lines: List[str], idx: int) -> Tuple[dict, int]:
+    """
+    Parse network object-group block from ASA config lines.
+    Returns the parsed group and the next line index.
+    """
     header = lines[idx].split()
     obj_grp = {'name': header[-1], 'members': []}
     idx += 1
     while idx < len(lines) and lines[idx].startswith(' '):
         l = lines[idx].strip()
-        if l.startswith('description '):
-            obj_grp['description'] = l[12:]
+        desc = extract_description(l)
+        if desc:
+            obj_grp['description'] = desc
         elif l.startswith('group-object '):
-            obj_grp['members'].append({'type': 'group_object', 'name': l.split()[-1]})
+            append_group_member(obj_grp['members'], {'type': 'group_object', 'name': l.split()[-1]})
         elif l.startswith('network-object object '):
-            obj_grp['members'].append({'type': 'object', 'name': l.split()[-1]})
+            append_group_member(obj_grp['members'], {'type': 'object', 'name': l.split()[-1]})
         elif l.startswith('network-object host '):
             ip = l.split()[-1]
             try:
                 ipaddress.ip_address(ip)
-                obj_grp['members'].append({'type': 'host', 'ip_address': ip})
+                append_group_member(obj_grp['members'], {'type': 'host', 'ip_address': ip})
             except ValueError:
                 logger.warning(f"Invalid host IP in group: {ip}")
         elif l.startswith('network-object '):
@@ -236,7 +275,7 @@ def parse_network_object_group(lines, idx):
                 network, netmask = parts[1], parts[2]
                 try:
                     ipaddress.IPv4Network(f"{network}/{netmask}")
-                    obj_grp['members'].append({'type': 'subnet', 'network': network, 'netmask': netmask})
+                    append_group_member(obj_grp['members'], {'type': 'subnet', 'network': network, 'netmask': netmask})
                 except ValueError:
                     logger.warning(f"Invalid subnet in group: {network} {netmask}")
             # host
@@ -244,25 +283,29 @@ def parse_network_object_group(lines, idx):
                 ip = parts[1]
                 try:
                     ipaddress.ip_address(ip)
-                    obj_grp['members'].append({'type': 'host', 'ip_address': ip})
+                    append_group_member(obj_grp['members'], {'type': 'host', 'ip_address': ip})
                 except ValueError:
                     logger.warning(f"Invalid host IP in group: {ip}")
         idx += 1
     return obj_grp, idx
 
-def parse_service_object_group(lines, idx):
-    """Parse service object-group block."""
+def parse_service_object_group(lines: List[str], idx: int) -> Tuple[dict, int]:
+    """
+    Parse service object-group block from ASA config lines.
+    Returns the parsed group and the next line index.
+    """
     header = lines[idx].split()
     obj_grp = {'name': header[-1], 'members': []}
     idx += 1
     while idx < len(lines) and lines[idx].startswith(' '):
         l = lines[idx].strip()
-        if l.startswith('description '):
-            obj_grp['description'] = l[12:]
+        desc = extract_description(l)
+        if desc:
+            obj_grp['description'] = desc
         elif l.startswith('group-object '):
-            obj_grp['members'].append({'type': 'group_object', 'name': l.split()[-1]})
+            append_group_member(obj_grp['members'], {'type': 'group_object', 'name': l.split()[-1]})
         elif l.startswith('service-object object '):
-            obj_grp['members'].append({'type': 'object', 'name': l.split()[-1]})
+            append_group_member(obj_grp['members'], {'type': 'object', 'name': l.split()[-1]})
         elif l.startswith('service-object '):
             # eq (allow spaces and special chars in port name)
             m_eq = re.match(r'service-object ([\w\-_.:/+]+) destination eq (.+)', l)
@@ -270,11 +313,11 @@ def parse_service_object_group(lines, idx):
             m_range = re.match(r'service-object ([\w\-_.:/+]+) destination range (.+) (.+)', l)
             if m_eq:
                 port = m_eq.group(2).strip()
-                obj_grp['members'].append({'type': 'port', 'protocol': m_eq.group(1), 'value': translate_service_name_to_port(port)})
+                append_group_member(obj_grp['members'], {'type': 'port', 'protocol': m_eq.group(1), 'value': translate_service_name_to_port(port)})
             elif m_range:
                 start = m_range.group(2).strip()
                 end = m_range.group(3).strip()
-                obj_grp['members'].append({
+                append_group_member(obj_grp['members'], {
                     'type': 'port_range',
                     'protocol': m_range.group(1),
                     'start': translate_service_name_to_port(start),
@@ -283,8 +326,11 @@ def parse_service_object_group(lines, idx):
         idx += 1
     return obj_grp, idx
 
-def parse_acl_entity(tokens, idx):
-    """Parse source or destination entity in ACL."""
+def parse_acl_entity(tokens: List[str], idx: int) -> Tuple[dict, int]:
+    """
+    Parse source or destination entity in ACL.
+    Returns the parsed entity and the next token index.
+    """
     if idx >= len(tokens):
         return {'type': 'any', 'value': 'any'}, idx
     t = tokens[idx]
@@ -304,10 +350,11 @@ def parse_acl_entity(tokens, idx):
         return {'type': 'host', 'ip_address': t}, idx + 1
     return {'type': 'unknown', 'value': t}, idx + 1
 
-def parse_access_list(line):
+def parse_access_list(line: str) -> Optional[dict]:
     """
     Parse a single access-list line into YAML structure.
     Handles all ASA ACL forms: protocol/service, source, destination, port (if present).
+    Returns a dict with ACL name and entry, or None if invalid.
     """
     tokens = line.split()
     if len(tokens) < 6 or tokens[2] != 'extended':
@@ -373,7 +420,11 @@ def parse_access_list(line):
 
 # --- SANITY CHECKS ---
 
-def sanity_check_network_object(obj):
+def sanity_check_network_object(obj: dict) -> bool:
+    """
+    Sanity check for network object structure and values.
+    Returns True if valid, False otherwise.
+    """
     if 'name' not in obj or 'type' not in obj:
         return False
     if obj['type'] == 'host':
@@ -400,7 +451,11 @@ def sanity_check_network_object(obj):
         return False
     return True
 
-def sanity_check_service_object(obj):
+def sanity_check_service_object(obj: dict) -> bool:
+    """
+    Sanity check for service object structure and values.
+    Returns True if valid, False otherwise.
+    """
     if 'name' not in obj or 'protocol' not in obj:
         return False
     # protocol must be a known protocol
@@ -412,21 +467,33 @@ def sanity_check_service_object(obj):
             return False
     return True
 
-def sanity_check_network_object_group(obj_grp):
+def sanity_check_network_object_group(obj_grp: dict) -> bool:
+    """
+    Sanity check for network object-group structure and values.
+    Returns True if valid, False otherwise.
+    """
     if 'name' not in obj_grp or 'members' not in obj_grp:
         return False
     if not isinstance(obj_grp['members'], list):
         return False
     return True
 
-def sanity_check_service_object_group(obj_grp):
+def sanity_check_service_object_group(obj_grp: dict) -> bool:
+    """
+    Sanity check for service object-group structure and values.
+    Returns True if valid, False otherwise.
+    """
     if 'name' not in obj_grp or 'members' not in obj_grp:
         return False
     if not isinstance(obj_grp['members'], list):
         return False
     return True
 
-def sanity_check_acl_entry(entry):
+def sanity_check_acl_entry(entry: dict) -> bool:
+    """
+    Sanity check for ACL entry structure and values.
+    Returns True if valid, False otherwise.
+    """
     # action must be permit or deny
     if entry['action'] not in ('permit', 'deny'):
         return False
@@ -466,16 +533,20 @@ def sanity_check_acl_entry(entry):
             return False
     return True
 
-def write_yaml(filepath, data, top_level_key=None):
-    """Write data to YAML file, creating directories if needed, with optional top-level key."""
+def write_yaml(filepath: str, data: Any, top_level_key: Optional[str] = None) -> None:
+    """
+    Write data to YAML file, creating directories if needed, with optional top-level key.
+    """
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     if top_level_key:
         data = {top_level_key: data}
     with open(filepath, 'w', encoding="utf-8") as f:
         yaml.dump(data, f, sort_keys=False, allow_unicode=True)
 
-def print_summary(stats):
-    """Print summary of ASA to YAML conversion."""
+def print_summary(stats: dict) -> None:
+    """
+    Print summary of ASA to YAML conversion.
+    """
     print("\n=== ASA to YAML Conversion Summary ===")
     print(f"Network objects:        {stats['net_objects']['parsed']} parsed, {stats['net_objects']['skipped']} skipped")
     print(f"Service objects:        {stats['svc_objects']['parsed']} parsed, {stats['svc_objects']['skipped']} skipped")
@@ -486,8 +557,13 @@ def print_summary(stats):
         print(f"Critical errors:        {stats['critical_errors']}")
     print("See ./log/asa2yaml.log for details on skipped/failed entries.\n")
 
-def main():
-    config_file = os.path.join("config", "asa_config.txt")
+def main() -> None:
+    """
+    Main entry point for ASA to YAML conversion.
+    Parses config, writes YAML, prints summary, and exits with error code if needed.
+    Also writes a structured error report to log/error_report_asa.yaml.
+    """
+    config_file = os.path.join("config", "sample_asa_config.txt")
     net_objects, svc_objects, net_object_groups, svc_object_groups, access_lists, stats = parse_asa_config(config_file)
     write_yaml(os.path.join("yaml", "objects_network.yaml"), net_objects, top_level_key="network_objects")
     write_yaml(os.path.join("yaml", "objects_service.yaml"), svc_objects, top_level_key="service_objects")
@@ -497,6 +573,24 @@ def main():
     write_yaml(os.path.join("yaml", "access-lists.yaml"), acl_yaml, top_level_key="access_lists")
 
     print_summary(stats)
+
+    # Write structured error report
+    error_report = {
+        'timestamp': datetime.datetime.now().isoformat(),
+        'critical_errors': stats.get('critical_errors', 0),
+        'skipped': {
+            'network_objects': stats['net_objects']['skipped'],
+            'service_objects': stats['svc_objects']['skipped'],
+            'network_object_groups': stats['net_obj_groups']['skipped'],
+            'service_object_groups': stats['svc_obj_groups']['skipped'],
+            'acl_entries': stats['acl_entries']['skipped'],
+        }
+    }
+    try:
+        write_yaml(ERROR_REPORT_PATH, error_report)
+        logger.info(f"Error report written to {ERROR_REPORT_PATH}")
+    except Exception as e:
+        logger.error(f"Failed to write error report: {e}")
 
     # Exit with non-zero code if critical errors occurred
     if stats['critical_errors'] > 0:

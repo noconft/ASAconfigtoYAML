@@ -1,5 +1,5 @@
 # Cisco ASA Service Name to Port Mapping
-# Format: service_name: port_number (protocol is not used in lookup)
+# Format: service_name: port_number
 SERVICE_NAME_TO_PORT = {
     'aol': 5190,
     'bgp': 179,
