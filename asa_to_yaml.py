@@ -2,13 +2,41 @@ import re
 import yaml
 import os
 import sys
-import ipaddress 
+import ipaddress
 from collections import defaultdict
-from logger import get_logger  # Import the centralized logger
+from logger import get_logger
 from service_name_to_port import SERVICE_NAME_TO_PORT
+from asa_icmp_type_map import ASA_ICMP_TYPE_MAP
 
-logger = get_logger()  # Initialize the logger
+logger = get_logger()
 
+# --- Utility Functions ---
+def translate_service_name_to_port(port, protocol=None):
+    """Translate ASA service name to port number if possible, else return original.
+    For ICMP, map type name to (type, code) if possible.
+    """
+    if protocol and protocol.lower() == 'icmp':
+        # For ICMP, ASA config only accepts exact names as in the mapping
+        if isinstance(port, str):
+            if port in ASA_ICMP_TYPE_MAP:
+                return ASA_ICMP_TYPE_MAP[port]
+            logger.warning(f"Unknown ICMP type name '{port}' encountered; leaving as string.")
+            return port
+        return port
+    if isinstance(port, int):
+        return port
+    if isinstance(port, str):
+        # Use port name as-is for lookup
+        try:
+            return int(port)
+        except ValueError:
+            if port in SERVICE_NAME_TO_PORT:
+                return SERVICE_NAME_TO_PORT[port]
+            logger.warning(f"Unknown service name '{port}' encountered; leaving as string.")
+            return port
+    return port
+
+# --- Parsing Functions ---
 def parse_asa_config(filepath):
     """Parse ASA config file and extract objects, object-groups, and access-lists."""
     with open(filepath, encoding="utf-8") as f:
@@ -19,14 +47,8 @@ def parse_asa_config(filepath):
     access_lists = defaultdict(list)
 
     # Stats for summary
-    stats = {
-        'net_objects': {'parsed': 0, 'skipped': 0},
-        'svc_objects': {'parsed': 0, 'skipped': 0},
-        'net_obj_groups': {'parsed': 0, 'skipped': 0},
-        'svc_obj_groups': {'parsed': 0, 'skipped': 0},
-        'acl_entries': {'parsed': 0, 'skipped': 0},
-        'critical_errors': 0
-    }
+    stats = {k: {'parsed': 0, 'skipped': 0} for k in ['net_objects', 'svc_objects', 'net_obj_groups', 'svc_obj_groups', 'acl_entries']}
+    stats['critical_errors'] = 0
 
     i = 0
     while i < len(lines):
@@ -130,62 +152,58 @@ def parse_network_object(lines, idx):
         idx += 1
     return obj, idx
 
-def translate_service_name_to_port(port):
-    """Translate ASA service name to port number if possible, else return original."""
-    if isinstance(port, int):
-        return port
-    if isinstance(port, str):
-        # Normalize: strip, lower, replace multiple spaces with single, replace spaces with dash/underscore
-        port_norm = re.sub(r'\s+', '-', port.strip().lower())
-        # Try direct int
-        try:
-            return int(port_norm)
-        except ValueError:
-            # Try direct lookup
-            if port_norm in SERVICE_NAME_TO_PORT:
-                return SERVICE_NAME_TO_PORT[port_norm]
-            # Try with underscores (for some mappings)
-            port_us = port_norm.replace('-', '_')
-            if port_us in SERVICE_NAME_TO_PORT:
-                return SERVICE_NAME_TO_PORT[port_us]
-            # Try with spaces removed
-            port_nospace = port_norm.replace('-', '')
-            if port_nospace in SERVICE_NAME_TO_PORT:
-                return SERVICE_NAME_TO_PORT[port_nospace]
-            logger.warning(f"Unknown service name '{port}' (normalized: '{port_norm}') encountered; leaving as string.")
-            return port
-    return port
-
 def parse_service_object(lines, idx):
-    """Parse service object block, supporting multi-token service names and ports."""
     header = lines[idx].split()
     obj = {'name': header[-1]}
     idx += 1
     while idx < len(lines) and lines[idx].startswith(' '):
         l = lines[idx].strip()
-        # Support multi-token service names and ports
         if l.startswith('service '):
-            # Split on 'destination eq' or 'destination range'
-            if 'destination eq' in l:
+            m_icmp = re.match(r'service\s+icmp\s+([\w\-]+)(?:\s+(\d+))?', l)
+            if m_icmp:
+                obj['protocol'] = 'icmp'
+                icmp_type = m_icmp.group(1)
+                icmp_code = m_icmp.group(2)
+                mapped = translate_service_name_to_port(icmp_type, protocol='icmp')
+                if isinstance(mapped, tuple):
+                    obj['icmp_type'] = mapped[0]
+                    obj['icmp_code'] = int(icmp_code) if icmp_code is not None else mapped[1]
+                else:
+                    obj['icmp_type_name'] = icmp_type
+                    if icmp_code is not None:
+                        obj['icmp_code'] = int(icmp_code)
+            elif 'destination eq' in l:
                 pre, post = l.split('destination eq', 1)
                 proto = pre.replace('service', '').strip()
                 port = post.strip()
                 obj['protocol'] = proto
-                obj['destination_port'] = translate_service_name_to_port(port)
+                if proto.lower() == 'icmp':
+                    mapped = translate_service_name_to_port(port, protocol='icmp')
+                    if isinstance(mapped, tuple):
+                        obj['icmp_type'] = mapped[0]
+                        obj['icmp_code'] = mapped[1]
+                    else:
+                        obj['icmp_type_name'] = port
+                else:
+                    obj['destination_port'] = translate_service_name_to_port(port)
             elif 'destination range' in l:
                 pre, post = l.split('destination range', 1)
                 proto = pre.replace('service', '').strip()
-                # The post part may have multi-token start and end ports
-                # Try to split only on the first space
                 parts = post.strip().split()
                 if len(parts) >= 2:
                     start = parts[0]
                     end = ' '.join(parts[1:])
                     obj['protocol'] = proto
-                    obj['destination_port_range'] = {
-                        'start': translate_service_name_to_port(start),
-                        'end': translate_service_name_to_port(end)
-                    }
+                    if proto.lower() == 'icmp':
+                        obj['icmp_type_range'] = {
+                            'start': translate_service_name_to_port(start, protocol='icmp'),
+                            'end': translate_service_name_to_port(end, protocol='icmp')
+                        }
+                    else:
+                        obj['destination_port_range'] = {
+                            'start': translate_service_name_to_port(start),
+                            'end': translate_service_name_to_port(end)
+                        }
         if l.startswith('description '):
             obj['description'] = l[12:]
         idx += 1
@@ -388,6 +406,10 @@ def sanity_check_service_object(obj):
     # protocol must be a known protocol
     if obj['protocol'] not in ('tcp', 'udp', 'icmp', 'ip'):
         return False
+    # For ICMP, require icmp_type or icmp_type_range
+    if obj['protocol'] == 'icmp':
+        if 'icmp_type' not in obj and 'icmp_type_range' not in obj:
+            return False
     return True
 
 def sanity_check_network_object_group(obj_grp):
@@ -465,7 +487,7 @@ def print_summary(stats):
     print("See ./log/asa2yaml.log for details on skipped/failed entries.\n")
 
 def main():
-    config_file = os.path.join("config", "sample_asa_config.txt")
+    config_file = os.path.join("config", "asa_config.txt")
     net_objects, svc_objects, net_object_groups, svc_object_groups, access_lists, stats = parse_asa_config(config_file)
     write_yaml(os.path.join("yaml", "objects_network.yaml"), net_objects, top_level_key="network_objects")
     write_yaml(os.path.join("yaml", "objects_service.yaml"), svc_objects, top_level_key="service_objects")
