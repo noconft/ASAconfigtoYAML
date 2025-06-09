@@ -1,22 +1,20 @@
-import re
-import yaml
 import os
+import re
 import sys
+import yaml
 import ipaddress
 from collections import defaultdict
+from typing import Any, Dict, List, Optional, Tuple
 from logger import get_logger
 from service_name_to_port import SERVICE_NAME_TO_PORT
 from asa_icmp_type_map import ASA_ICMP_TYPE_MAP
-from typing import Any, Dict, List, Optional, Tuple
+from ciscoconfparse2 import CiscoConfParse
 
 logger = get_logger()
 
 # --- Utility Functions ---
 def translate_service_name_to_port(port: Any, protocol: Optional[str] = None) -> Any:
-    """
-    Translate ASA service name to port number if possible, else return original.
-    For ICMP, map type name to (type, code) if possible.
-    """
+    """Translate ASA service name to port number if possible, else return original."""
     if protocol and protocol.lower() == 'icmp':
         if isinstance(port, str):
             if port in ASA_ICMP_TYPE_MAP:
@@ -46,367 +44,272 @@ def append_group_member(members: List[dict], member: dict) -> None:
         members.append(member)
 
 # --- Parsing Functions ---
+def parse_network_objects_ciscoconfparse(parse: CiscoConfParse) -> Tuple[List[dict], int]:
+    """Parse network objects using ciscoconfparse2. Returns (objects, skipped_count)."""
+    net_objects = []
+    skipped = 0
+    for obj in parse.find_objects(r"^object network "):
+        name = obj.text.split()[-1]
+        net_obj = {'name': name}
+        for child in obj.children:
+            line = child.text.strip()
+            if line.startswith('host '):
+                ip = line.split(' ', 1)[1]
+                try:
+                    ipaddress.ip_address(ip)
+                    net_obj['type'] = 'host'
+                    net_obj['ip_address'] = ip
+                except ValueError:
+                    logger.warning(f"Invalid host IP address: {ip}")
+            elif line.startswith('subnet '):
+                parts = line.split()
+                if len(parts) == 3:
+                    network, netmask = parts[1], parts[2]
+                    try:
+                        ipaddress.IPv4Network(f"{network}/{netmask}")
+                        net_obj['type'] = 'subnet'
+                        net_obj['network'] = network
+                        net_obj['netmask'] = netmask
+                    except ValueError:
+                        logger.warning(f"Invalid subnet: {network} {netmask}")
+            elif line.startswith('fqdn '):
+                net_obj['type'] = 'fqdn'
+                net_obj['fqdn'] = line.split(' ', 1)[1]
+            elif line.startswith('range '):
+                parts = line.split()
+                if len(parts) == 3:
+                    start, end = parts[1], parts[2]
+                    try:
+                        ipaddress.ip_address(start)
+                        ipaddress.ip_address(end)
+                        net_obj['type'] = 'range'
+                        net_obj['ip_range'] = {'start': start, 'end': end}
+                    except ValueError:
+                        logger.warning(f"Invalid IP range: {start} {end}")
+            desc = extract_description(line)
+            if desc:
+                net_obj['description'] = desc
+        if sanity_check_network_object(net_obj):
+            net_objects.append(net_obj)
+        else:
+            logger.warning(f"Invalid network object: {net_obj}")
+            skipped += 1
+    return net_objects, skipped
+
+def parse_service_objects_ciscoconfparse(parse: CiscoConfParse) -> Tuple[List[dict], int]:
+    """Parse service objects using ciscoconfparse2. Returns (objects, skipped_count)."""
+    svc_objects = []
+    skipped = 0
+    for obj in parse.find_objects(r"^object service "):
+        name = obj.text.split()[-1]
+        svc_obj = {'name': name}
+        for child in obj.children:
+            line = child.text.strip()
+            if line.startswith('service '):
+                m_icmp = re.match(r'service\s+icmp\s+([\w\-]+)(?:\s+(\d+))?', line)
+                if m_icmp:
+                    svc_obj['protocol'] = 'icmp'
+                    icmp_type = m_icmp.group(1)
+                    icmp_code = m_icmp.group(2)
+                    mapped = translate_service_name_to_port(icmp_type, protocol='icmp')
+                    if isinstance(mapped, tuple):
+                        svc_obj['icmp_type'] = mapped[0]
+                        svc_obj['icmp_code'] = int(icmp_code) if icmp_code is not None else mapped[1]
+                    else:
+                        svc_obj['icmp_type_name'] = icmp_type
+                        if icmp_code is not None:
+                            svc_obj['icmp_code'] = int(icmp_code)
+                elif 'destination eq' in line:
+                    pre, post = line.split('destination eq', 1)
+                    proto = pre.replace('service', '').strip()
+                    port = post.strip()
+                    svc_obj['protocol'] = proto
+                    if proto.lower() == 'icmp':
+                        mapped = translate_service_name_to_port(port, protocol='icmp')
+                        if isinstance(mapped, tuple):
+                            svc_obj['icmp_type'] = mapped[0]
+                            svc_obj['icmp_code'] = mapped[1]
+                        else:
+                            svc_obj['icmp_type_name'] = port
+                    else:
+                        svc_obj['destination_port'] = translate_service_name_to_port(port)
+                elif 'destination range' in line:
+                    pre, post = line.split('destination range', 1)
+                    proto = pre.replace('service', '').strip()
+                    parts = post.strip().split()
+                    if len(parts) >= 2:
+                        start = parts[0]
+                        end = ' '.join(parts[1:])
+                        svc_obj['protocol'] = proto
+                        if proto.lower() == 'icmp':
+                            svc_obj['icmp_type_range'] = {
+                                'start': translate_service_name_to_port(start, protocol='icmp'),
+                                'end': translate_service_name_to_port(end, protocol='icmp')
+                            }
+                        else:
+                            svc_obj['destination_port_range'] = {
+                                'start': translate_service_name_to_port(start),
+                                'end': translate_service_name_to_port(end)
+                            }
+            desc = extract_description(line)
+            if desc:
+                svc_obj['description'] = desc
+        if sanity_check_service_object(svc_obj):
+            svc_objects.append(svc_obj)
+        else:
+            logger.warning(f"Invalid service object: {svc_obj}")
+            skipped += 1
+    return svc_objects, skipped
+
+def parse_object_group_members(lines: List[str], group_type: str) -> List[dict]:
+    """Generic parser for object-group members."""
+    members = []
+    for line in lines:
+        line = line.strip()
+        if group_type == 'network':
+            if line.startswith('group-object '):
+                append_group_member(members, {'type': 'group_object', 'name': line.split()[-1]})
+            elif line.startswith('network-object object '):
+                append_group_member(members, {'type': 'object', 'name': line.split()[-1]})
+            elif line.startswith('network-object host '):
+                ip = line.split()[-1]
+                try:
+                    ipaddress.ip_address(ip)
+                    append_group_member(members, {'type': 'host', 'ip_address': ip})
+                except ValueError:
+                    logger.warning(f"Invalid host IP in group: {ip}")
+            elif line.startswith('network-object '):
+                parts = line.split()
+                if len(parts) == 3 and re.match(r'\d+\.\d+\.\d+\.\d+', parts[1]) and re.match(r'\d+\.\d+\.\d+\.\d+', parts[2]):
+                    network, netmask = parts[1], parts[2]
+                    try:
+                        ipaddress.IPv4Network(f"{network}/{netmask}")
+                        append_group_member(members, {'type': 'subnet', 'network': network, 'netmask': netmask})
+                    except ValueError:
+                        logger.warning(f"Invalid subnet in group: {network} {netmask}")
+                elif len(parts) == 2 and re.match(r'\d+\.\d+\.\d+\.\d+', parts[1]):
+                    ip = parts[1]
+                    try:
+                        ipaddress.ip_address(ip)
+                        append_group_member(members, {'type': 'host', 'ip_address': ip})
+                    except ValueError:
+                        logger.warning(f"Invalid host IP in group: {ip}")
+        elif group_type == 'service':
+            if line.startswith('group-object '):
+                append_group_member(members, {'type': 'group_object', 'name': line.split()[-1]})
+            elif line.startswith('service-object object '):
+                append_group_member(members, {'type': 'object', 'name': line.split()[-1]})
+            elif line.startswith('service-object '):
+                m_eq = re.match(r'service-object ([\w\-_.:/+]+) destination eq (.+)', line)
+                m_range = re.match(r'service-object ([\w\-_.:/+]+) destination range (.+) (.+)', line)
+                if m_eq:
+                    port = m_eq.group(2).strip()
+                    append_group_member(members, {'type': 'port', 'protocol': m_eq.group(1), 'value': translate_service_name_to_port(port)})
+                elif m_range:
+                    start = m_range.group(2).strip()
+                    end = m_range.group(3).strip()
+                    append_group_member(members, {
+                        'type': 'port_range',
+                        'protocol': m_range.group(1),
+                        'start': translate_service_name_to_port(start),
+                        'end': translate_service_name_to_port(end)
+                    })
+    return members
+
+def parse_network_object_groups_ciscoconfparse(parse: CiscoConfParse) -> Tuple[List[dict], int]:
+    """Parse network object-groups using ciscoconfparse2. Returns (groups, skipped_count)."""
+    net_obj_groups = []
+    skipped = 0
+    for obj in parse.find_objects(r"^object-group network "):
+        name = obj.text.split()[-1]
+        obj_grp = {'name': name, 'members': []}
+        desc = None
+        member_lines = []
+        for child in obj.children:
+            line = child.text.strip()
+            d = extract_description(line)
+            if d:
+                desc = d
+            else:
+                member_lines.append(line)
+        if desc:
+            obj_grp['description'] = desc
+        obj_grp['members'] = parse_object_group_members(member_lines, 'network')
+        if sanity_check_network_object_group(obj_grp):
+            net_obj_groups.append(obj_grp)
+        else:
+            logger.warning(f"Invalid network object-group: {obj_grp}")
+            skipped += 1
+    return net_obj_groups, skipped
+
+def parse_service_object_groups_ciscoconfparse(parse: CiscoConfParse) -> Tuple[List[dict], int]:
+    """Parse service object-groups using ciscoconfparse2. Returns (groups, skipped_count)."""
+    svc_obj_groups = []
+    skipped = 0
+    for obj in parse.find_objects(r"^object-group service "):
+        name = obj.text.split()[-1]
+        obj_grp = {'name': name, 'members': []}
+        desc = None
+        member_lines = []
+        for child in obj.children:
+            line = child.text.strip()
+            d = extract_description(line)
+            if d:
+                desc = d
+            else:
+                member_lines.append(line)
+        if desc:
+            obj_grp['description'] = desc
+        obj_grp['members'] = parse_object_group_members(member_lines, 'service')
+        if sanity_check_service_object_group(obj_grp):
+            svc_obj_groups.append(obj_grp)
+        else:
+            logger.warning(f"Invalid service object-group: {obj_grp}")
+            skipped += 1
+    return svc_obj_groups, skipped
+
+def parse_access_lists_ciscoconfparse(parse: CiscoConfParse) -> Tuple[Dict[str, List[dict]], int]:
+    """Parse access-list entries using ciscoconfparse2. Returns (acl_dict, skipped_count)."""
+    access_lists = defaultdict(list)
+    skipped = 0
+    for obj in parse.find_objects(r"^access-list "):
+        line = obj.text.strip()
+        acl_entry = parse_access_list(line)
+        if acl_entry and sanity_check_acl_entry(acl_entry['entry']):
+            access_lists[acl_entry['acl_name']].append(acl_entry['entry'])
+        else:
+            logger.warning(f"Invalid ACL entry: {line}")
+            skipped += 1
+    return access_lists, skipped
+
 def parse_asa_config(filepath: str) -> Tuple[List[dict], List[dict], List[dict], List[dict], Dict[str, List[dict]], dict]:
     """
     Parse ASA config file and extract objects, object-groups, and access-lists.
     Returns all parsed objects, object-groups, access-lists, and stats.
     """
-    with open(filepath, encoding="utf-8") as f:
-        lines = [line.rstrip() for line in f]
+    parse = CiscoConfParse(filepath, syntax='asa')
+    net_objects, net_skipped = parse_network_objects_ciscoconfparse(parse)
+    svc_objects, svc_skipped = parse_service_objects_ciscoconfparse(parse)
+    net_object_groups, net_grp_skipped = parse_network_object_groups_ciscoconfparse(parse)
+    svc_object_groups, svc_grp_skipped = parse_service_object_groups_ciscoconfparse(parse)
+    access_lists, acl_skipped = parse_access_lists_ciscoconfparse(parse)
 
-    net_objects, svc_objects = [], []
-    net_object_groups, svc_object_groups = [], []
-    access_lists = defaultdict(list)
-
-    # Stats for summary
     stats = {k: {'parsed': 0, 'skipped': 0} for k in ['net_objects', 'svc_objects', 'net_obj_groups', 'svc_obj_groups', 'acl_entries']}
     stats['critical_errors'] = 0
 
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        try:
-            if line.startswith("object network"):
-                obj, i = parse_network_object(lines, i)
-                if sanity_check_network_object(obj):
-                    net_objects.append(obj)
-                    stats['net_objects']['parsed'] += 1
-                    continue
-                logger.warning(f"Invalid network object at line {i}: {obj}")
-                stats['net_objects']['skipped'] += 1
-                continue
-            if line.startswith("object service"):
-                obj, i = parse_service_object(lines, i)
-                if sanity_check_service_object(obj):
-                    svc_objects.append(obj)
-                    stats['svc_objects']['parsed'] += 1
-                    continue
-                logger.warning(f"Invalid service object at line {i}: {obj}")
-                stats['svc_objects']['skipped'] += 1
-                continue
-            if line.startswith("object-group network"):
-                obj_grp, i = parse_network_object_group(lines, i)
-                if sanity_check_network_object_group(obj_grp):
-                    net_object_groups.append(obj_grp)
-                    stats['net_obj_groups']['parsed'] += 1
-                    continue
-                logger.warning(f"Invalid network object-group at line {i}: {obj_grp}")
-                stats['net_obj_groups']['skipped'] += 1
-                continue
-            if line.startswith("object-group service"):
-                obj_grp, i = parse_service_object_group(lines, i)
-                if sanity_check_service_object_group(obj_grp):
-                    svc_object_groups.append(obj_grp)
-                    stats['svc_obj_groups']['parsed'] += 1
-                    continue
-                logger.warning(f"Invalid service object-group at line {i}: {obj_grp}")
-                stats['svc_obj_groups']['skipped'] += 1
-                continue
-            if line.startswith("access-list"):
-                if "remark" in line:
-                    i += 1
-                    continue
-                acl = parse_access_list(line)
-                if acl and sanity_check_acl_entry(acl['entry']):
-                    access_lists[acl['acl_name']].append(acl['entry'])
-                    stats['acl_entries']['parsed'] += 1
-                    i += 1
-                    continue
-                logger.warning(f"Invalid access-list at line {i}: {line}")
-                stats['acl_entries']['skipped'] += 1
-                i += 1
-                continue
-            i += 1
-        except Exception as e:
-            logger.error(f"Exception at line {i}: {line} | Error: {e}")
-            stats['critical_errors'] += 1
-            i += 1
+    stats['net_objects']['parsed'] = len(net_objects)
+    stats['svc_objects']['parsed'] = len(svc_objects)
+    stats['net_obj_groups']['parsed'] = len(net_object_groups)
+    stats['svc_obj_groups']['parsed'] = len(svc_object_groups)
+    stats['acl_entries']['parsed'] = sum(len(v) for v in access_lists.values())
+
+    stats['net_objects']['skipped'] = net_skipped
+    stats['svc_objects']['skipped'] = svc_skipped
+    stats['net_obj_groups']['skipped'] = net_grp_skipped
+    stats['svc_obj_groups']['skipped'] = svc_grp_skipped
+    stats['acl_entries']['skipped'] = acl_skipped
+
     return net_objects, svc_objects, net_object_groups, svc_object_groups, access_lists, stats
-
-def parse_network_object(lines: List[str], idx: int) -> Tuple[dict, int]:
-    """
-    Parse network object block from ASA config lines.
-    Returns the parsed object and the next line index.
-    """
-    header = lines[idx].split()
-    obj = {'name': header[-1]}
-    idx += 1
-    while idx < len(lines) and lines[idx].startswith(' '):
-        l = lines[idx].strip()
-        if l.startswith('host '):
-            ip = l.split(' ', 1)[1]
-            try:
-                ipaddress.ip_address(ip)  # Validate
-                obj['type'] = 'host'
-                obj['ip_address'] = ip
-            except ValueError:
-                logger.warning(f"Invalid host IP address: {ip}")
-        elif l.startswith('subnet '):
-            parts = l.split()
-            if len(parts) == 3:
-                network, netmask = parts[1], parts[2]
-                try:
-                    ipaddress.IPv4Network(f"{network}/{netmask}")
-                    obj['type'] = 'subnet'
-                    obj['network'] = network
-                    obj['netmask'] = netmask
-                except ValueError:
-                    logger.warning(f"Invalid subnet: {network} {netmask}")
-        elif l.startswith('fqdn '):
-            obj['type'] = 'fqdn'
-            obj['fqdn'] = l.split(' ', 1)[1]
-        elif l.startswith('range '):
-            parts = l.split()
-            if len(parts) == 3:
-                start, end = parts[1], parts[2]
-                try:
-                    ipaddress.ip_address(start)
-                    ipaddress.ip_address(end)
-                    obj['type'] = 'range'
-                    obj['ip_range'] = {'start': start, 'end': end}
-                except ValueError:
-                    logger.warning(f"Invalid IP range: {start} {end}")
-        desc = extract_description(l)
-        if desc:
-            obj['description'] = desc
-        idx += 1
-    return obj, idx
-
-def parse_service_object(lines: List[str], idx: int) -> Tuple[dict, int]:
-    """
-    Parse service object block from ASA config lines.
-    Returns the parsed object and the next line index.
-    """
-    header = lines[idx].split()
-    obj = {'name': header[-1]}
-    idx += 1
-    while idx < len(lines) and lines[idx].startswith(' '):
-        l = lines[idx].strip()
-        if l.startswith('service '):
-            m_icmp = re.match(r'service\s+icmp\s+([\w\-]+)(?:\s+(\d+))?', l)
-            if m_icmp:
-                obj['protocol'] = 'icmp'
-                icmp_type = m_icmp.group(1)
-                icmp_code = m_icmp.group(2)
-                mapped = translate_service_name_to_port(icmp_type, protocol='icmp')
-                if isinstance(mapped, tuple):
-                    obj['icmp_type'] = mapped[0]
-                    obj['icmp_code'] = int(icmp_code) if icmp_code is not None else mapped[1]
-                else:
-                    obj['icmp_type_name'] = icmp_type
-                    if icmp_code is not None:
-                        obj['icmp_code'] = int(icmp_code)
-            elif 'destination eq' in l:
-                pre, post = l.split('destination eq', 1)
-                proto = pre.replace('service', '').strip()
-                port = post.strip()
-                obj['protocol'] = proto
-                if proto.lower() == 'icmp':
-                    mapped = translate_service_name_to_port(port, protocol='icmp')
-                    if isinstance(mapped, tuple):
-                        obj['icmp_type'] = mapped[0]
-                        obj['icmp_code'] = mapped[1]
-                    else:
-                        obj['icmp_type_name'] = port
-                else:
-                    obj['destination_port'] = translate_service_name_to_port(port)
-            elif 'destination range' in l:
-                pre, post = l.split('destination range', 1)
-                proto = pre.replace('service', '').strip()
-                parts = post.strip().split()
-                if len(parts) >= 2:
-                    start = parts[0]
-                    end = ' '.join(parts[1:])
-                    obj['protocol'] = proto
-                    if proto.lower() == 'icmp':
-                        obj['icmp_type_range'] = {
-                            'start': translate_service_name_to_port(start, protocol='icmp'),
-                            'end': translate_service_name_to_port(end, protocol='icmp')
-                        }
-                    else:
-                        obj['destination_port_range'] = {
-                            'start': translate_service_name_to_port(start),
-                            'end': translate_service_name_to_port(end)
-                        }
-        desc = extract_description(l)
-        if desc:
-            obj['description'] = desc
-        idx += 1
-    return obj, idx
-
-def parse_network_object_group(lines: List[str], idx: int) -> Tuple[dict, int]:
-    """
-    Parse network object-group block from ASA config lines.
-    Returns the parsed group and the next line index.
-    """
-    header = lines[idx].split()
-    obj_grp = {'name': header[-1], 'members': []}
-    idx += 1
-    while idx < len(lines) and lines[idx].startswith(' '):
-        l = lines[idx].strip()
-        desc = extract_description(l)
-        if desc:
-            obj_grp['description'] = desc
-        elif l.startswith('group-object '):
-            append_group_member(obj_grp['members'], {'type': 'group_object', 'name': l.split()[-1]})
-        elif l.startswith('network-object object '):
-            append_group_member(obj_grp['members'], {'type': 'object', 'name': l.split()[-1]})
-        elif l.startswith('network-object host '):
-            ip = l.split()[-1]
-            try:
-                ipaddress.ip_address(ip)
-                append_group_member(obj_grp['members'], {'type': 'host', 'ip_address': ip})
-            except ValueError:
-                logger.warning(f"Invalid host IP in group: {ip}")
-        elif l.startswith('network-object '):
-            parts = l.split()
-            # subnet
-            if len(parts) == 3 and re.match(r'\d+\.\d+\.\d+\.\d+', parts[1]) and re.match(r'\d+\.\d+\.\d+\.\d+', parts[2]):
-                network, netmask = parts[1], parts[2]
-                try:
-                    ipaddress.IPv4Network(f"{network}/{netmask}")
-                    append_group_member(obj_grp['members'], {'type': 'subnet', 'network': network, 'netmask': netmask})
-                except ValueError:
-                    logger.warning(f"Invalid subnet in group: {network} {netmask}")
-            # host
-            elif len(parts) == 2 and re.match(r'\d+\.\d+\.\d+\.\d+', parts[1]):
-                ip = parts[1]
-                try:
-                    ipaddress.ip_address(ip)
-                    append_group_member(obj_grp['members'], {'type': 'host', 'ip_address': ip})
-                except ValueError:
-                    logger.warning(f"Invalid host IP in group: {ip}")
-        idx += 1
-    return obj_grp, idx
-
-def parse_service_object_group(lines: List[str], idx: int) -> Tuple[dict, int]:
-    """
-    Parse service object-group block from ASA config lines.
-    Returns the parsed group and the next line index.
-    """
-    header = lines[idx].split()
-    obj_grp = {'name': header[-1], 'members': []}
-    idx += 1
-    while idx < len(lines) and lines[idx].startswith(' '):
-        l = lines[idx].strip()
-        desc = extract_description(l)
-        if desc:
-            obj_grp['description'] = desc
-        elif l.startswith('group-object '):
-            append_group_member(obj_grp['members'], {'type': 'group_object', 'name': l.split()[-1]})
-        elif l.startswith('service-object object '):
-            append_group_member(obj_grp['members'], {'type': 'object', 'name': l.split()[-1]})
-        elif l.startswith('service-object '):
-            # eq (allow spaces and special chars in port name)
-            m_eq = re.match(r'service-object ([\w\-_.:/+]+) destination eq (.+)', l)
-            # range (allow spaces and special chars in port names)
-            m_range = re.match(r'service-object ([\w\-_.:/+]+) destination range (.+) (.+)', l)
-            if m_eq:
-                port = m_eq.group(2).strip()
-                append_group_member(obj_grp['members'], {'type': 'port', 'protocol': m_eq.group(1), 'value': translate_service_name_to_port(port)})
-            elif m_range:
-                start = m_range.group(2).strip()
-                end = m_range.group(3).strip()
-                append_group_member(obj_grp['members'], {
-                    'type': 'port_range',
-                    'protocol': m_range.group(1),
-                    'start': translate_service_name_to_port(start),
-                    'end': translate_service_name_to_port(end)
-                })
-        idx += 1
-    return obj_grp, idx
-
-def parse_acl_entity(tokens: List[str], idx: int) -> Tuple[dict, int]:
-    """
-    Parse source or destination entity in ACL.
-    Returns the parsed entity and the next token index.
-    """
-    if idx >= len(tokens):
-        return {'type': 'any', 'value': 'any'}, idx
-    t = tokens[idx]
-    # any
-    if t == 'any':
-        return {'type': 'any', 'value': 'any'}, idx + 1
-    # host
-    if t == 'host' and idx + 1 < len(tokens):
-        return {'type': 'host', 'ip_address': tokens[idx + 1]}, idx + 2
-    # object/object-group <name>
-    if t in ('object', 'object-group') and idx + 1 < len(tokens):
-        return {'type': t, 'name': tokens[idx + 1]}, idx + 2
-    # subnet
-    if re.match(r'\d+\.\d+\.\d+\.\d+', t):
-        if idx + 1 < len(tokens) and re.match(r'\d+\.\d+\.\d+\.\d+', tokens[idx + 1]):
-            return {'type': 'subnet', 'network': t, 'netmask': tokens[idx + 1]}, idx + 2
-        return {'type': 'host', 'ip_address': t}, idx + 1
-    return {'type': 'unknown', 'value': t}, idx + 1
-
-def parse_access_list(line: str) -> Optional[dict]:
-    """
-    Parse a single access-list line into YAML structure.
-    Handles all ASA ACL forms: protocol/service, source, destination, port (if present).
-    Returns a dict with ACL name and entry, or None if invalid.
-    """
-    tokens = line.split()
-    if len(tokens) < 6 or tokens[2] != 'extended':
-        return None
-    acl_name = tokens[1]
-    action = tokens[3]
-    if action not in ('permit', 'deny'):
-        return None  # sanity check
-    idx = 4
-
-    # 1. Service/protocol (can be 2 tokens)
-    proto_token = tokens[idx]
-    service = {}
-    if proto_token in ('tcp', 'udp', 'icmp', 'ip'):
-        service['type'] = proto_token
-        idx += 1
-        port_after = True
-    elif proto_token in ('object', 'object-group'):
-        service['type'] = proto_token
-        service['name'] = tokens[idx + 1]
-        idx += 2
-        port_after = False
-    else:
-        service['type'] = proto_token
-        idx += 1
-        port_after = True
-
-    # 2. Source (can be 2 tokens)
-    source, idx = parse_acl_entity(tokens, idx)
-    # 3. Destination (can be 2 tokens)
-    destination, idx = parse_acl_entity(tokens, idx)
-
-    # Port (for tcp/udp, after destination)
-    if port_after and service['type'] in ('tcp', 'udp') and idx < len(tokens):
-        # eq or range, allow multi-token port names
-        if tokens[idx] == 'eq':
-            # Collect all tokens after 'eq' as port name (could be multi-word)
-            port_tokens = []
-            j = idx + 1
-            while j < len(tokens) and not tokens[j] in ('log', 'inactive', 'time-range', 'established'):
-                port_tokens.append(tokens[j])
-                j += 1
-            port = ' '.join(port_tokens)
-            service['destination_port'] = translate_service_name_to_port(port)
-            idx = j
-        elif tokens[idx] == 'range':
-            # Collect start and end (could be multi-word, but usually 2 tokens)
-            start = tokens[idx + 1]
-            end = tokens[idx + 2]
-            service['destination_port_range'] = {
-                'start': translate_service_name_to_port(start),
-                'end': translate_service_name_to_port(end)
-            }
-            idx += 3
-
-    entry = {
-        'source': source,
-        'destination': destination,
-        'service': service,
-        'action': action
-    }
-    return {'acl_name': acl_name, 'entry': entry}
 
 # --- SANITY CHECKS ---
 
@@ -552,7 +455,7 @@ def main() -> None:
     Main entry point for ASA to YAML conversion.
     Parses config, writes YAML, prints summary, and exits with error code if needed.
     """
-    config_file = os.path.join("config", "sample_asa_config.txt")
+    config_file = os.path.join("config", "asa_config.txt")
     net_objects, svc_objects, net_object_groups, svc_object_groups, access_lists, stats = parse_asa_config(config_file)
     write_yaml(os.path.join("yaml", "objects_network.yaml"), net_objects, top_level_key="network_objects")
     write_yaml(os.path.join("yaml", "objects_service.yaml"), svc_objects, top_level_key="service_objects")
