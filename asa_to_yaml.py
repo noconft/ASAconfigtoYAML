@@ -5,6 +5,7 @@ import yaml
 import ipaddress
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
+
 from logger import get_logger
 from service_name_to_port import SERVICE_NAME_TO_PORT
 from asa_icmp_type_map import ASA_ICMP_TYPE_MAP
@@ -15,12 +16,12 @@ logger = get_logger()
 # --- Utility Functions ---
 def translate_service_name_to_port(port: Any, protocol: Optional[str] = None) -> Any:
     """Translate ASA service name to port number if possible, else return original."""
-    if protocol and protocol.lower() == 'icmp':
+    if protocol and protocol == 'icmp':
         if isinstance(port, str):
-            if port in ASA_ICMP_TYPE_MAP:
-                return ASA_ICMP_TYPE_MAP[port]
+            mapped = ASA_ICMP_TYPE_MAP.get(port)
+            if mapped is not None:
+                return mapped
             logger.warning(f"Unknown ICMP type name '{port}' encountered; leaving as string.")
-            return port
         return port
     if isinstance(port, int):
         return port
@@ -28,15 +29,16 @@ def translate_service_name_to_port(port: Any, protocol: Optional[str] = None) ->
         try:
             return int(port)
         except ValueError:
-            if port in SERVICE_NAME_TO_PORT:
-                return SERVICE_NAME_TO_PORT[port]
+            mapped = SERVICE_NAME_TO_PORT.get(port)
+            if mapped is not None:
+                return mapped
             logger.warning(f"Unknown service name '{port}' encountered; leaving as string.")
-            return port
+        return port
     return port
 
-def extract_description(line: str) -> str:
+def extract_description(line: str) -> Optional[str]:
     """Extract description from a config line if present."""
-    return line[12:] if line.startswith('description ') else ''
+    return line[12:] if line.startswith('description ') else None
 
 def append_group_member(members: List[dict], member: dict) -> None:
     """Append a member to a group, avoiding duplicates."""
@@ -46,8 +48,7 @@ def append_group_member(members: List[dict], member: dict) -> None:
 # --- Parsing Functions ---
 def parse_network_objects_ciscoconfparse(parse: CiscoConfParse) -> Tuple[List[dict], int]:
     """Parse network objects using ciscoconfparse2. Returns (objects, skipped_count)."""
-    net_objects = []
-    skipped = 0
+    net_objects, skipped = [], 0
     for obj in parse.find_objects(r"^object network "):
         name = obj.text.split()[-1]
         net_obj = {'name': name}
@@ -98,8 +99,7 @@ def parse_network_objects_ciscoconfparse(parse: CiscoConfParse) -> Tuple[List[di
 
 def parse_service_objects_ciscoconfparse(parse: CiscoConfParse) -> Tuple[List[dict], int]:
     """Parse service objects using ciscoconfparse2. Returns (objects, skipped_count)."""
-    svc_objects = []
-    skipped = 0
+    svc_objects, skipped = [], 0
     for obj in parse.find_objects(r"^object service "):
         name = obj.text.split()[-1]
         svc_obj = {'name': name}
@@ -124,7 +124,7 @@ def parse_service_objects_ciscoconfparse(parse: CiscoConfParse) -> Tuple[List[di
                     proto = pre.replace('service', '').strip()
                     port = post.strip()
                     svc_obj['protocol'] = proto
-                    if proto.lower() == 'icmp':
+                    if proto == 'icmp':
                         mapped = translate_service_name_to_port(port, protocol='icmp')
                         if isinstance(mapped, tuple):
                             svc_obj['icmp_type'] = mapped[0]
@@ -138,10 +138,9 @@ def parse_service_objects_ciscoconfparse(parse: CiscoConfParse) -> Tuple[List[di
                     proto = pre.replace('service', '').strip()
                     parts = post.strip().split()
                     if len(parts) >= 2:
-                        start = parts[0]
-                        end = ' '.join(parts[1:])
+                        start, end = parts[0], ' '.join(parts[1:])
                         svc_obj['protocol'] = proto
-                        if proto.lower() == 'icmp':
+                        if proto == 'icmp':
                             svc_obj['icmp_type_range'] = {
                                 'start': translate_service_name_to_port(start, protocol='icmp'),
                                 'end': translate_service_name_to_port(end, protocol='icmp')
