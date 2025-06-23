@@ -295,9 +295,9 @@ def main() -> None:
         ],
         'skipped': {
             'network_objects': 0,
-            'service_objects': 0
-            # 'network_object_groups': 0,
-            # 'service_object_groups': 0,
+            'service_objects': 0,
+            'network_object_groups': 0,
+            'service_object_groups': 0,
             # 'acl_entries': 0
         },
         'critical_errors': 0
@@ -309,8 +309,6 @@ def main() -> None:
         config_lines += convert_service_objects(svc_objs.get('service_objects', []), stats)
         config_lines += convert_network_object_groups(net_obj_grps.get('network_object_groups', []), stats)
         config_lines += convert_service_object_groups(svc_obj_grps.get('service_object_groups', []), stats)
-        config_lines += convert_network_object_groups(net_obj_grps.get('network_object_groups', []), stats)
-        # config_lines += convert_service_object_groups(svc_obj_grps.get('service_object_groups', []), stats)
         # config_lines += convert_access_lists(acl_yaml.get('access_lists', []), stats)
         write_trusguard_config(config_lines, outpath)
         logger.info(f"TrusGuard configuration written to {outpath}")
