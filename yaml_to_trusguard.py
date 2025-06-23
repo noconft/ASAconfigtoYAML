@@ -164,21 +164,72 @@ def convert_network_object_groups(network_object_groups: List[Dict[str, Any]], s
     Convert network object-groups from YAML to TrusGuard CLI/config syntax.
     Returns a list of configuration lines.
     """
-    # TODO: Implement mapping to TrusGuard format
-    # For now, just count as skipped if not empty
-    if network_object_groups:
-        stats['network_object_groups_skipped'] += len(network_object_groups)
-    return []
+    config_lines = []
+    for group in network_object_groups:
+        name = group.get('name')
+        members = group.get('members', [])
+        description = group.get('description', '')
+        if not name or not members:
+            logger.warning(f"Skipping invalid network object-group: {group}")
+            stats['network_object_groups_skipped'] += 1
+            continue
+        # Example TrusGuard syntax (adjust as needed):
+        config_lines.append(f"object-group address add {name} '{description}'")
+        for member in members:
+            mtype = member.get('type')
+            if mtype == 'host':
+                config_lines.append(f"object-group address member {name} host {member['ip_address']}")
+            elif mtype == 'subnet':
+                config_lines.append(f"object-group address member {name} subnet {member['network']} {member['netmask']}")
+            elif mtype == 'range':
+                ipr = member.get('ip_range')
+                if ipr:
+                    config_lines.append(f"object-group address member {name} range {ipr['start']} {ipr['end']}")
+            elif mtype == 'object':
+                config_lines.append(f"object-group address member {name} object {member['name']}")
+            elif mtype == 'group_object':
+                config_lines.append(f"object-group address member {name} group-object {member['name']}")
+            else:
+                logger.warning(f"Unknown member type in network object-group: {member}")
+                stats['network_object_groups_skipped'] += 1
+        config_lines.append("")  # Blank line for readability
+    return config_lines
 
 def convert_service_object_groups(service_object_groups: List[Dict[str, Any]], stats: dict) -> List[str]:
     """
     Convert service object-groups from YAML to TrusGuard CLI/config syntax.
     Returns a list of configuration lines.
     """
-    # TODO: Implement mapping to TrusGuard format
-    if service_object_groups:
-        stats['service_object_groups_skipped'] += len(service_object_groups)
-    return []
+    config_lines = []
+    for group in service_object_groups:
+        name = group.get('name')
+        members = group.get('members', [])
+        description = group.get('description', '')
+        if not name or not members:
+            logger.warning(f"Skipping invalid service object-group: {group}")
+            stats['service_object_groups_skipped'] += 1
+            continue
+        config_lines.append(f"object-group service add {name} '{description}'")
+        for member in members:
+            mtype = member.get('type')
+            if mtype == 'port':
+                proto = member.get('protocol')
+                value = member.get('value')
+                config_lines.append(f"object-group service member {name} {proto} eq {value}")
+            elif mtype == 'port_range':
+                proto = member.get('protocol')
+                start = member.get('start')
+                end = member.get('end')
+                config_lines.append(f"object-group service member {name} {proto} range {start} {end}")
+            elif mtype == 'object':
+                config_lines.append(f"object-group service member {name} object {member['name']}")
+            elif mtype == 'group_object':
+                config_lines.append(f"object-group service member {name} group-object {member['name']}")
+            else:
+                logger.warning(f"Unknown member type in service object-group: {member}")
+                stats['service_object_groups_skipped'] += 1
+        config_lines.append("")  # Blank line for readability
+    return config_lines
 
 def convert_access_lists(access_lists: List[Dict[str, Any]], stats: dict) -> List[str]:
     """
@@ -256,7 +307,7 @@ def main() -> None:
         config_lines: List[str] = []
         config_lines += convert_network_objects(net_objs.get('network_objects', []), stats)
         config_lines += convert_service_objects(svc_objs.get('service_objects', []), stats)
-        # config_lines += convert_network_object_groups(net_obj_grps.get('network_object_groups', []), stats)
+        config_lines += convert_network_object_groups(net_obj_grps.get('network_object_groups', []), stats)
         # config_lines += convert_service_object_groups(svc_obj_grps.get('service_object_groups', []), stats)
         # config_lines += convert_access_lists(acl_yaml.get('access_lists', []), stats)
         write_trusguard_config(config_lines, outpath)
