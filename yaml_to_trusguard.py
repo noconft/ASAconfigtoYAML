@@ -89,7 +89,7 @@ def convert_network_objects(network_objects: List[Dict[str, Any]], stats: dict) 
             logger.warning(f"Unknown network object type: {obj_type} in {obj}")
             stats['network_objects_skipped'] += 1
             continue
-        config_lines.append("")  # Blank line for readability
+        config_lines.append("")
     return config_lines
 
 def convert_service_objects(service_objects: List[Dict[str, Any]], stats: dict) -> List[str]:
@@ -162,37 +162,25 @@ def convert_service_objects(service_objects: List[Dict[str, Any]], stats: dict) 
 def convert_network_object_groups(network_object_groups: List[Dict[str, Any]], stats: dict) -> List[str]:
     """
     Convert network object-groups from YAML to TrusGuard CLI/config syntax.
-    Returns a list of configuration lines.
+    Syntax (as provided by user):
+    object ip_address ipv4_group add <groupname> <members separated with ;> <description> <vlanid>
+    Example:
+    object ip_address ipv4_group add TESTHOSTS2 TESTHOST1;TESTHOST2;TESTdepartment just_description ""
     """
     config_lines = []
     for group in network_object_groups:
         name = group.get('name')
         members = group.get('members', [])
         description = group.get('description', '')
+        vlanid = ""
         if not name or not members:
             logger.warning(f"Skipping invalid network object-group: {group}")
-            stats['network_object_groups_skipped'] += 1
+            stats['network_object_groups_skipped'] = stats.get('network_object_groups_skipped', 0) + 1
             continue
-        # Example TrusGuard syntax (adjust as needed):
-        config_lines.append(f"object-group address add {name} '{description}'")
-        for member in members:
-            mtype = member.get('type')
-            if mtype == 'host':
-                config_lines.append(f"object-group address member {name} host {member['ip_address']}")
-            elif mtype == 'subnet':
-                config_lines.append(f"object-group address member {name} subnet {member['network']} {member['netmask']}")
-            elif mtype == 'range':
-                ipr = member.get('ip_range')
-                if ipr:
-                    config_lines.append(f"object-group address member {name} range {ipr['start']} {ipr['end']}")
-            elif mtype == 'object':
-                config_lines.append(f"object-group address member {name} object {member['name']}")
-            elif mtype == 'group_object':
-                config_lines.append(f"object-group address member {name} group-object {member['name']}")
-            else:
-                logger.warning(f"Unknown member type in network object-group: {member}")
-                stats['network_object_groups_skipped'] += 1
-        config_lines.append("")  # Blank line for readability
+        # Only use the 'name' field of each member
+        member_names = [member['name'] for member in members if 'name' in member]
+        members_str = ";".join(member_names)
+        config_lines.append(f'object ip_address ipv4_group add {name} {members_str} {description} "{vlanid}"')
     return config_lines
 
 def convert_service_object_groups(service_object_groups: List[Dict[str, Any]], stats: dict) -> List[str]:
@@ -207,7 +195,7 @@ def convert_service_object_groups(service_object_groups: List[Dict[str, Any]], s
         description = group.get('description', '')
         if not name or not members:
             logger.warning(f"Skipping invalid service object-group: {group}")
-            stats['service_object_groups_skipped'] += 1
+            stats['service_object_groups_skipped'] = stats.get('service_object_groups_skipped', 0) + 1
             continue
         config_lines.append(f"object-group service add {name} '{description}'")
         for member in members:
@@ -227,7 +215,7 @@ def convert_service_object_groups(service_object_groups: List[Dict[str, Any]], s
                 config_lines.append(f"object-group service member {name} group-object {member['name']}")
             else:
                 logger.warning(f"Unknown member type in service object-group: {member}")
-                stats['service_object_groups_skipped'] += 1
+                stats['service_object_groups_skipped'] = stats.get('service_object_groups_skipped', 0) + 1
         config_lines.append("")  # Blank line for readability
     return config_lines
 
@@ -236,10 +224,27 @@ def convert_access_lists(access_lists: List[Dict[str, Any]], stats: dict) -> Lis
     Convert access-lists from YAML to TrusGuard CLI/config syntax.
     Returns a list of configuration lines.
     """
-    # TODO: Implement mapping to TrusGuard format
-    if access_lists:
-        stats['acl_entries_skipped'] += len(access_lists)
-    return []
+    config_lines = []
+    for acl in access_lists:
+        acl_name = acl.get('acl_name')
+        entry = acl.get('entry', {})
+        if not acl_name or not entry:
+            logger.warning(f"Skipping invalid ACL entry: {acl}")
+            stats['acl_entries_skipped'] += 1
+            continue
+        action = entry.get('action')
+        service = entry.get('service', {})
+        src = entry.get('source', {})
+        dst = entry.get('destination', {})
+        # Compose source and destination strings
+        src_str = src.get('ip_address') or src.get('network') or src.get('name') or src.get('type', '')
+        dst_str = dst.get('ip_address') or dst.get('network') or dst.get('name') or dst.get('type', '')
+        service_type = service.get('type', '')
+        port = service.get('port', '')
+        # This is a placeholder; adjust to match TrusGuard ACL syntax
+        config_lines.append(f"policy add")
+        config_lines.append("")  # Blank line for readability
+    return config_lines
 
 def write_trusguard_config(config_lines: List[str], outpath: str) -> None:
     """
@@ -262,7 +267,7 @@ def print_summary(error_report: dict) -> None:
     print(f"Service objects skipped:        {error_report['skipped']['service_objects']}")
     print(f"Network object-groups skipped:  {error_report['skipped'].get('network_object_groups', 0)}")
     print(f"Service object-groups skipped:  {error_report['skipped'].get('service_object_groups', 0)}")
-    # print(f"Access-list entries skipped:    {error_report['skipped'].get('acl_entries', 0)}")
+    print(f"Access-list entries skipped:    {error_report['skipped'].get('acl_entries', 0)}")
     if error_report['critical_errors']:
         print(f"Critical errors:                {error_report['critical_errors']}")
     print(f"See {ERROR_REPORT_PATH} for details on skipped/failed entries.\n")
@@ -298,7 +303,7 @@ def main() -> None:
             'service_objects': 0,
             'network_object_groups': 0,
             'service_object_groups': 0,
-            # 'acl_entries': 0
+            'acl_entries': 0
         },
         'critical_errors': 0
     }
@@ -309,7 +314,7 @@ def main() -> None:
         config_lines += convert_service_objects(svc_objs.get('service_objects', []), stats)
         config_lines += convert_network_object_groups(net_obj_grps.get('network_object_groups', []), stats)
         config_lines += convert_service_object_groups(svc_obj_grps.get('service_object_groups', []), stats)
-        # config_lines += convert_access_lists(acl_yaml.get('access_lists', []), stats)
+        config_lines += convert_access_lists(acl_yaml.get('access_lists', []), stats)
         write_trusguard_config(config_lines, outpath)
         logger.info(f"TrusGuard configuration written to {outpath}")
     except Exception as e:
