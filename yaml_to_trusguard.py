@@ -260,8 +260,8 @@ def print_summary(error_report: dict) -> None:
         print(f"YAML files failed to load: {', '.join(error_report['failed_loads'])}")
     print(f"Network objects skipped:        {error_report['skipped']['network_objects']}")
     print(f"Service objects skipped:        {error_report['skipped']['service_objects']}")
-    # print(f"Network object-groups skipped:  {error_report['skipped'].get('network_object_groups', 0)}")
-    # print(f"Service object-groups skipped:  {error_report['skipped'].get('service_object_groups', 0)}")
+    print(f"Network object-groups skipped:  {error_report['skipped'].get('network_object_groups', 0)}")
+    print(f"Service object-groups skipped:  {error_report['skipped'].get('service_object_groups', 0)}")
     # print(f"Access-list entries skipped:    {error_report['skipped'].get('acl_entries', 0)}")
     if error_report['critical_errors']:
         print(f"Critical errors:                {error_report['critical_errors']}")
@@ -307,6 +307,8 @@ def main() -> None:
         config_lines: List[str] = []
         config_lines += convert_network_objects(net_objs.get('network_objects', []), stats)
         config_lines += convert_service_objects(svc_objs.get('service_objects', []), stats)
+        config_lines += convert_network_object_groups(net_obj_grps.get('network_object_groups', []), stats)
+        config_lines += convert_service_object_groups(svc_obj_grps.get('service_object_groups', []), stats)
         config_lines += convert_network_object_groups(net_obj_grps.get('network_object_groups', []), stats)
         # config_lines += convert_service_object_groups(svc_obj_grps.get('service_object_groups', []), stats)
         # config_lines += convert_access_lists(acl_yaml.get('access_lists', []), stats)
